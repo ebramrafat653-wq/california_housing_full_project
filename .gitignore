@@ -216,3 +216,91 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# =============================================================================
+# 🤖 MACHINE LEARNING & DATA SCIENCE — ADDITIONS
+# =============================================================================
+
+# ── Large Data Files (Optional: ignore if >100MB) ───────────────────────────
+# *.csv
+# *.xlsx
+*.parquet
+*.feather
+*.avro
+*.orc
+*.h5
+*.hdf5
+*.npz
+*.npy
+*.safetensors
+
+# ── Model Artifacts & Checkpoints ───────────────────────────────────────────
+models/
+model_exports/
+checkpoints/
+*.pkl
+*.pickle
+*.joblib
+*.pt
+*.pth
+*.pth.tar
+*.bin
+*.onnx
+*.pb
+*.tflite
+*.mlmodel
+*.keras
+*.mar
+
+# ── ML Framework Logs & Caches ──────────────────────────────────────────────
+# TensorFlow / Keras
+tensorboard_logs/
+*.events.out.tfevents.*
+keras_metadata.pb
+
+# PyTorch Lightning
+lightning_logs/
+
+# Hugging Face
+*.safetensors
+hf_cache/
+.huggingface/
+
+# ── ML Experiment Tracking ──────────────────────────────────────────────────
+# MLflow
+mlruns/
+mlflow.db
+*.mlflow
+
+# Weights & Biases
+wandb/
+.wandb/
+wandb-offline/
+
+# DVC (Data Version Control)
+.dvc/
+.dvc/tmp/
+dvc.lock
+
+# ── Jupyter & Notebook Outputs (Optional) ───────────────────────────────────
+# *.ipynb  # ← Uncomment if you don't want to track notebooks at all
+.ipynb_checkpoints/
+*.nbconvert.html
+
+# ── AutoML & Hyperparameter Tuning ──────────────────────────────────────────
+optuna_study.db
+*.optuna
+ray_results/
+
+# ── Docker / Container for ML (If used) ─────────────────────────────────────
+# Docker build cache
+.docker/
+*.dockerignore
+
+# ── Temporary ML Processing Files ───────────────────────────────────────────
+temp_features/
+cache_features/
+*.feature_cache
+
+
+
