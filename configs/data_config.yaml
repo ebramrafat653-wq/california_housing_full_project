@@ -1,0 +1,25 @@
+dataset:
+  name: "california_housing"
+  source: "kaggle"
+  kaggle_id: "saraferguswps/california-housing"
+
+project_name: "california_housing_full_project"
+
+paths:
+  base: "/content/drive/MyDrive/MLprojects/california_housing_full_project"
+  kaggle_json: "/content/drive/MyDrive/kaggle.json"
+
+  raw_data: "/content/drive/MyDrive/MLprojects/california_housing_full_project/data/raw/"
+  processed_data: "/content/drive/MyDrive/MLprojects/california_housing_full_project/data/processed/"
+  model_path: "/content/drive/MyDrive/MLprojects/california_housing_full_project/models/"
+  metrics_path: "/content/drive/MyDrive/MLprojects/california_housing_full_project/reports/"
+
+target_column: "median_house_value"
+
+validation:
+  max_missing_ratio: 0.3
+  min_rows: 100
+
+split:
+  test_size: 0.2
+  random_state: 42
