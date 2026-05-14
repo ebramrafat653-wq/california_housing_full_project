@@ -51,6 +51,47 @@ coverage.xml
 .pytest_cache/
 cover/
 
+# =============================================================================
+# DVC (Data Version Control)
+# =============================================================================
+.dvc/cache/
+.dvc/tmp/
+.dvc/lock
+*.dvc.lock
+.dvc/plots/
+.dvc/state
+
+# =============================================================================
+# DATA (tracked by DVC, not Git)
+# =============================================================================
+data/raw/**/*
+data/interim/**/*
+data/processed/**/*
+models/
+reports/figures/**/*
+
+# ✅ CRITICAL: Allow config/schema files and DVC metadata (do not ignore!)
+!.dvc/config
+!.dvc/config.local
+!.dvcignore
+!*.dvc
+!configs/
+!src/
+!tests/
+!requirements.txt
+!pyproject.toml
+!README.md
+
+# =============================================================================
+# SECRETS & CREDENTIALS
+# =============================================================================
+.kaggle/kaggle.json
+ssh_config/
+*.pem
+*.key
+.env
+*.env
+
 # Translations
 *.mo
 *.pot
@@ -233,9 +274,10 @@ __marimo__/
 *.npz
 *.npy
 *.safetensors
+*.onnx
 
 # ── Model Artifacts & Checkpoints ───────────────────────────────────────────
-models/
+# models/ ← Already ignored in DATA section above
 model_exports/
 checkpoints/
 *.pkl
@@ -245,7 +287,6 @@ checkpoints/
 *.pth
 *.pth.tar
 *.bin
-*.onnx
 *.pb
 *.tflite
 *.mlmodel
@@ -262,7 +303,6 @@ keras_metadata.pb
 lightning_logs/
 
 # Hugging Face
-*.safetensors
 hf_cache/
 .huggingface/
 
@@ -276,11 +316,6 @@ mlflow.db
 wandb/
 .wandb/
 wandb-offline/
-
-# DVC (Data Version Control)
-.dvc/
-.dvc/tmp/
-dvc.lock
 
 # ── Jupyter & Notebook Outputs (Optional) ───────────────────────────────────
 # *.ipynb  # ← Uncomment if you don't want to track notebooks at all
