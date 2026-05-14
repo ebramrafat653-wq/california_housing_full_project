@@ -1,20 +1,85 @@
-
 [build-system]
 requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "ml_project"
-version = "0.1.0"
-description = "Production-ready ML project"
+name = "california-housing-full-project"
+version = "1.0.0"
+description = "Production-ready ML pipeline for California Housing price prediction"
+readme = "README.md"
 requires-python = ">=3.9"
+license = {text = "MIT"}
 
-dependencies = [
-    "pandas",
-    "scikit-learn",
-    "numpy"
+authors = [
+    {name = "Your Name", email = "your.email@example.com"}
 ]
 
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["src*"]
+keywords = ["machine-learning", "california-housing", "dvc", "colab", "mlops"]
+
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    # Core data & ML
+    "pandas>=2.0.0",
+    "numpy>=1.24.0",
+    "scikit-learn>=1.3.0",
+    
+    # Config & utilities
+    "pyyaml>=6.0",
+    "tqdm>=4.66.0",
+    "typeguard>=4.0.0",
+    
+    # Data versioning (with Google Drive support)
+    "dvc[gdrive]>=3.40.0",
+    
+    # Data source
+    "kaggle>=1.5.16",
+    
+    # Testing
+    "pytest>=7.4.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "black>=23.0",
+    "ruff>=0.1.0",
+    "mypy>=1.5",
+    "pytest-cov>=4.1",
+    "ipykernel>=6.0",  # For Jupyter/Colab development
+]
+
+# Optional: Let setuptools auto-discover packages (recommended)
+# [tool.setuptools.packages.find]
+# where = ["."]
+# include = ["src*"]
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+markers = [
+    "integration: end-to-end tests requiring external services (DVC, Kaggle)",
+    "slow: tests that take >5 seconds",
+    "requires_dvc: tests requiring DVC initialization",
+]
+addopts = "-v --strict-markers -m 'not integration'"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::UserWarning",
+]
+
+[tool.dvc]
+# Default DVC CLI options (optional)
+cache_dir = ".dvc/cache"
+# Note: 'remote' here is just a name; actual config via 'dvc remote add'

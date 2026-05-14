@@ -1,18 +1,94 @@
-# configs/data_config.yaml
+# =============================================================================
+# California Housing Project — Data Configuration
+# Compatible with: Linux, macOS, Windows, Google Colab
+# Used by: src/data/ingestion.py, src/data/validation.py, src/utils/colab_setup.py
+# =============================================================================
 
+# -----------------------------------------------------------------------------
+# DATASET SOURCE CONFIGURATION
+# -----------------------------------------------------------------------------
 dataset:
   name: "california_housing"
   source: "kaggle"
   kaggle_id: "saraferguswps/california-housing"
+  
+  # Expected files after download/unzip (for integrity checks)
+  expected_files:
+    - "housing.csv"
+  
+  # CSV parsing options (passed to pd.read_csv)
+  encoding: "utf-8"
+  csv_options:
+    sep: ","
+    header: 0
+    index_col: null
+    na_values: ["?", "NA", "N/A", "null", "None"]
 
-project_name: "california_housing_full_project"
-target_column: "median_house_value"
+# -----------------------------------------------------------------------------
+# PROJECT METADATA & TARGET SPECIFICATION
+# -----------------------------------------------------------------------------
+project:
+  name: "california_housing_full_project"
+  target: "median_house_value" 
+  task_type: "regression"       
+  description: "Predict median house value in California districts using census data"
 
+# -----------------------------------------------------------------------------
+# DATA VALIDATION RULES
+# -----------------------------------------------------------------------------
 validation:
   max_missing_ratio: 0.3
   min_rows: 100
+  min_columns: 5
+  
+  # Required columns that must exist (schema validation)
+  required_columns:
+    - "longitude"
+    - "latitude"
+    - "housing_median_age"
+    - "total_rooms"
+    - "total_bedrooms"
+    - "population"
+    - "households"
+    - "median_income"
+    - "ocean_proximity"
+    - "median_house_value"
+  
+  # Allow fully-null columns (default: false → raise error)
+  allow_fully_null_columns: false
 
+# -----------------------------------------------------------------------------
+# TRAIN/TEST SPLIT CONFIGURATION
+# -----------------------------------------------------------------------------
 split:
   test_size: 0.2
   random_state: 42
+  shuffle: true  # Explicit for reproducibility
 
+# -----------------------------------------------------------------------------
+# DVC DATA VERSIONING CONFIGURATION
+# -----------------------------------------------------------------------------
+dvc:
+  enabled: true
+  
+  remote:
+    # ⚠️ REPLACE WITH YOUR ACTUAL GOOGLE DRIVE FOLDER ID
+    gdrive_id: "1XyZ9AbC8DeF7GhI6JkL"  # ← استبدل بالـ ID الحقيقي
+    name: "mydrive"
+    default: true
+  
+  tracked_paths:
+    - "data/raw"
+    - "data/interim"
+    - "data/processed"
+    - "models"
+  
+  auto_pull:
+    enabled: true
+    force: false
+    targets:
+      - "data/raw"
+  
+  cache:
+    type: "reflink,copy"  # Optimized for Google Drive filesystem
+    protected: false      # Allow editing cached files during development
