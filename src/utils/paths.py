@@ -3,222 +3,282 @@
 """
 Project path management module.
 
-Handles environment detection, project root resolution, and centralized
-path configuration for local, Colab, and Google Drive environments.
-Integrates with DVC for data versioning support.
+ARCHITECTURE:
+  - DATA_ROOT / MODELS_ROOT always reside INSIDE PROJECT_DIR → DVC tracks them normally.
+  - In Colab: symlinks transparently redirect those paths to Google Drive for persistence.
+  - Drive must be mounted BEFORE this module is imported in Colab.
+    Call setup_drive_symlinks() explicitly after mount_drive().
 """
 
 import os
-import sys
+import platform
+import shutil
 from pathlib import Path
 from typing import Optional
 
 from src.utils.logger import get_logger
 
-# Optional YAML support for DVC config parsing
 try:
     import yaml
-
     _YAML_AVAILABLE = True
 except ImportError:
     _YAML_AVAILABLE = False
-    yaml = None  # type: ignore
+    yaml = None
 
 logger = get_logger(__name__)
 
 # =============================================================================
-# ENVIRONMENT & ROOT DETECTION
+# CONSTANTS
 # =============================================================================
 
-IN_COLAB: bool = os.path.exists("/content")
+PROJECT_NAME: str = "california_housing_full_project"
 
+# Reliable Colab detection (env var set by Colab runtime)
+IN_COLAB: bool = "COLAB_RELEASE_TAG" in os.environ or os.path.exists("/content/drive")
+
+# Name used for DVC remote — single source of truth across all modules
+DVC_REMOTE_NAME: str = "mylocal"
+
+# =============================================================================
+# PROJECT ROOT
+# =============================================================================
 
 def get_project_root() -> Path:
-    """
-    Resolve project root from any execution context.
-
-    Searches upward from this file, with fallbacks for Colab and
-    environments without pyproject.toml or .git markers.
-
-    Returns:
-        Path object pointing to the project root directory.
-    """
+    """Resolve project root from __file__, Colab paths, or cwd — in that order."""
     try:
-        root = Path(__file__).resolve().parent.parent.parent
+        candidate = Path(__file__).resolve().parent.parent.parent
+        if (candidate / ".git").exists() or (candidate / "pyproject.toml").exists():
+            return candidate
     except NameError:
-        root = Path.cwd().resolve()
+        pass
 
-    if not (root / "pyproject.toml").exists() and not (root / ".git").exists():
-        if IN_COLAB:
-            root = Path("/content/california_housing_full_project")
+    if IN_COLAB:
+        for p in [Path(f"/content/{PROJECT_NAME}"), Path("/content")]:
+            if p.exists() and (p / "src").exists():
+                return p
 
-    if str(root) not in sys.path:
-        sys.path.insert(0, str(root))
-
-    return root
+    return Path.cwd().resolve()
 
 
 PROJECT_DIR: Path = get_project_root()
 
 # =============================================================================
-# PERSISTENT STORAGE CONFIGURATION
+# GOOGLE DRIVE BASE PATH
 # =============================================================================
 
-if IN_COLAB:
-    DRIVE_BASE = Path("/content/drive/MyDrive")
-else:
-    DRIVE_BASE = (
-        Path("H:/My Drive") if os.name == "nt" else Path.home() / "GoogleDrive"
-    )
+def _resolve_drive_base() -> Path:
+    if IN_COLAB:
+        return Path("/content/drive/MyDrive")
 
-DRIVE_PROJECT: Path = DRIVE_BASE / "MLprojects" / "california_housing_full_project"
+    env = os.environ.get("GOOGLE_DRIVE_PATH")
+    if env:
+        return Path(env)
+
+    system = platform.system()
+    home = Path.home()
+
+    if system == "Windows":
+        for p in ["G:/My Drive", "F:/My Drive", "E:/My Drive", "D:/My Drive"]:
+            if Path(p).exists():
+                logger.debug(f"Windows Drive resolved: {p}")
+                return Path(p)
+        return home / "GoogleDrive"
+
+    if system == "Darwin":
+        return home / "Library/CloudStorage/GoogleDrive-My Drive"
+
+    return home / "GoogleDrive"
+
+
+DRIVE_BASE: Path = _resolve_drive_base()
+
+# =============================================================================
+# DATA & MODEL ROOTS — always inside PROJECT_DIR (DVC-safe)
+# =============================================================================
+
+DATA_ROOT:   Path = PROJECT_DIR / "data"
+MODELS_ROOT: Path = PROJECT_DIR / "models"
+
+# =============================================================================
+# DRIVE SYMLINKS (Colab persistence)
+# =============================================================================
+
+def _make_symlink(local: Path, target: Path) -> None:
+    """
+    Create symlink local → target, removing empty git placeholders first.
+    No-op if symlink already points to the correct target.
+    """
+    if not DRIVE_BASE.exists():
+        logger.error(
+            "Google Drive not mounted — cannot create symlink. "
+            "Call mount_drive() before setup_drive_symlinks()."
+        )
+        return
+
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        logger.error(f"Cannot create Drive directory {target}: {e}")
+        return
+
+    if local.is_symlink():
+        if local.resolve() == target.resolve():
+            logger.debug(f"Symlink already correct: {local}")
+            return
+        local.unlink()
+        logger.debug(f"Removed stale symlink: {local}")
+
+    elif local.exists():
+        try:
+            shutil.rmtree(local)
+            logger.debug(f"Removed empty git placeholder: {local}")
+        except OSError as e:
+            logger.error(f"Cannot remove {local} to create symlink: {e}")
+            return
+
+    try:
+        local.symlink_to(target, target_is_directory=True)
+        logger.info(f"Symlink created: {local} → {target}")
+    except OSError as e:
+        logger.error(f"Cannot create symlink {local} → {target}: {e}")
+
+
+def setup_drive_symlinks() -> None:
+    """
+    Redirect DATA_ROOT and MODELS_ROOT to Google Drive via symlinks.
+
+    Must be called AFTER mount_drive() in Colab.
+    Safe to call multiple times (idempotent).
+    """
+    if not IN_COLAB:
+        logger.debug("Not in Colab — skipping Drive symlinks")
+        return
+
+    _make_symlink(DATA_ROOT,   DRIVE_BASE / PROJECT_NAME / "data")
+    _make_symlink(MODELS_ROOT, DRIVE_BASE / PROJECT_NAME / "models")
 
 # =============================================================================
 # CENTRALIZED PATH REGISTRY
 # =============================================================================
 
 PATHS: dict[str, Path] = {
-    # Persistent data storage (Google Drive)
-    "raw": DRIVE_PROJECT / "data" / "raw",
-    "interim": DRIVE_PROJECT / "data" / "interim",
-    "processed": DRIVE_PROJECT / "data" / "processed",
-    "models": DRIVE_PROJECT / "models",
+    "raw":        DATA_ROOT  / "raw",
+    "interim":    DATA_ROOT  / "interim",
+    "processed":  DATA_ROOT  / "processed",
+    "models":     MODELS_ROOT,
     "kaggle_json": DRIVE_BASE / "kaggle.json",
-    # Local repository paths (ephemeral in Colab)
-    "configs": PROJECT_DIR / "configs",
-    "notebooks": PROJECT_DIR / "notebooks",
-    "reports": PROJECT_DIR / "reports",
-    "src": PROJECT_DIR / "src",
+    "configs":    PROJECT_DIR / "configs",
+    "notebooks":  PROJECT_DIR / "notebooks",
+    "reports":    PROJECT_DIR / "reports",
+    "src":        PROJECT_DIR / "src",
 }
 
+# DVC storage on Drive — used as the local DVC remote
+DVC_STORAGE: Path = DRIVE_BASE / "dvc_storage"
+
 # =============================================================================
-# DVC INTEGRATION PATHS & HELPERS
+# DVC HELPERS
 # =============================================================================
 
 DVC_CONFIG: Path = PROJECT_DIR / ".dvc" / "config"
-DVC_CACHE: Path = PROJECT_DIR / ".dvc" / "cache"
-DVC_LOCK: Path = PROJECT_DIR / ".dvc" / "lock"
+DVC_CACHE:  Path = PROJECT_DIR / ".dvc" / "cache"
 
 _DEFAULT_DVC_PATHS: list[Path] = [
-    PROJECT_DIR / "data" / "raw",
-    PROJECT_DIR / "data" / "interim",
-    PROJECT_DIR / "data" / "processed",
-    PROJECT_DIR / "models",
+    PATHS["raw"], PATHS["interim"], PATHS["processed"], PATHS["models"],
 ]
 
 
 def is_dvc_initialized() -> bool:
-    """
-    Check if DVC is properly initialized in this project.
-
-    Returns:
-        True if .dvc directory and config file exist.
-    """
+    """Return True if .dvc/ exists and has a config file."""
     return (PROJECT_DIR / ".dvc").exists() and DVC_CONFIG.exists()
 
 
 def get_dvc_tracked_paths() -> list[Path]:
-    """
-    Return list of paths configured for DVC tracking.
-
-    Reads from configs/data_config.yaml if available and PyYAML is installed;
-    otherwise returns sensible defaults.
-
-    Returns:
-        List of Path objects configured for DVC tracking.
-    """
+    """Return DVC-tracked paths from config YAML, falling back to defaults."""
     if not _YAML_AVAILABLE:
-        logger.debug("PyYAML not available; using default DVC paths")
         return _DEFAULT_DVC_PATHS
-
     try:
-        config_path = PROJECT_DIR / "configs" / "data_config.yaml"
-        if not config_path.exists():
-            logger.debug(f"DVC config not found: {config_path}; using defaults")
+        cfg = PATHS["configs"] / "data_config.yaml"
+        if not cfg.exists():
             return _DEFAULT_DVC_PATHS
-
-        with open(config_path, "r", encoding="utf-8") as f:
-            config = yaml.safe_load(f)
-
-        dvc_paths = config.get("dvc", {}).get("tracked_paths", [])
-        if dvc_paths:
-            return [PROJECT_DIR / p for p in dvc_paths]
-
-        logger.debug("No 'dvc.tracked_paths' in config; using defaults")
+        with open(cfg, encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+        raw = data.get("dvc", {}).get("tracked_paths", [])
+        return [PROJECT_DIR / Path(p) for p in raw] if raw else _DEFAULT_DVC_PATHS
+    except Exception as e:
+        logger.warning(f"get_dvc_tracked_paths failed: {e}")
         return _DEFAULT_DVC_PATHS
 
-    except (yaml.YAMLError, KeyError, OSError) as e:
-        logger.debug(f"Could not load DVC tracked paths: {type(e).__name__}: {e}")
-        return _DEFAULT_DVC_PATHS
+# =============================================================================
+# GIT CONFIGURATION
+# =============================================================================
 
+def configure_git_identity(cwd: Optional[Path] = None) -> None:
+    """
+    Configure git user identity (prevents commit errors in fresh Colab sessions).
+    Single source of truth — imported and used across colab_setup.py and ingestion.py.
+    """
+    import subprocess
+    cwd = cwd or PROJECT_DIR
+    for key, val in [("user.name", "Colab Bot"), ("user.email", "colab@bot.local")]:
+        subprocess.run(
+            ["git", "config", key, val],
+            cwd=str(cwd), capture_output=True, text=True, errors="replace", timeout=15,
+        )
 
 # =============================================================================
 # PATH UTILITIES
 # =============================================================================
 
-
 def get_path(stage: str, filename: Optional[str] = None) -> Path:
-    """
-    Retrieve or construct a path for a given data stage.
+    """Return registered path without creating directories."""
+    base = PATHS.get(stage, DATA_ROOT / stage)
+    return base / filename if filename else base
 
-    Creates parent directories automatically if they do not exist.
 
-    Args:
-        stage: Path category key (e.g., 'raw', 'processed').
-        filename: Optional filename to append to the directory path.
-
-    Returns:
-        Resolved Path object for the target file or directory.
-    """
-    target_dir = PATHS.get(stage, PROJECT_DIR / "data" / stage)
-    target_dir.mkdir(parents=True, exist_ok=True)
-    return target_dir / filename if filename else target_dir
+def ensure_path(stage: str, filename: Optional[str] = None) -> Path:
+    """Return registered path AND create directories if missing."""
+    base = PATHS.get(stage, DATA_ROOT / stage)
+    base.mkdir(parents=True, exist_ok=True)
+    return base / filename if filename else base
 
 
 def verify_paths() -> None:
-    """Print diagnostic summary of all configured paths."""
-    separator = "=" * 50
-    print(separator)
-    print(f"Environment : {'Colab' if IN_COLAB else 'Local'}")
-    print(f"Project Root: {PROJECT_DIR}")
-    print(f"Drive Base  : {DRIVE_BASE}")
-    print(separator)
+    """Print a diagnostic table of all registered paths."""
+    sep = "=" * 60
+    print(sep)
+    print(f"  Environment  : {'Google Colab' if IN_COLAB else 'Local'}")
+    print(f"  Project root : {PROJECT_DIR}")
+    print(f"  Drive base   : {DRIVE_BASE}")
+    print(f"  Data root    : {DATA_ROOT}"
+          + (f"  →  {DATA_ROOT.resolve()}" if DATA_ROOT.is_symlink() else ""))
+    print(f"  DVC remote   : {DVC_REMOTE_NAME}  →  {DVC_STORAGE}")
+    print(f"  DVC ready    : {is_dvc_initialized()}")
+    print(sep)
     for name, path in PATHS.items():
-        status = "✓" if path.exists() else "✗"
-        print(f"  {status} {name:12} → {path}")
-    print(separator)
+        ok  = "✓" if path.exists() else "✗"
+        sym = "  [→ Drive]"  if path.is_symlink() else ""
+        print(f"  {ok}  {name:<14} {path}{sym}")
+    print(sep)
 
 
 def ensure_drive_mounted() -> bool:
-    """
-    Verify Google Drive is accessible in Colab environment.
-
-    Returns:
-        True if Drive is mounted or not in Colab; False otherwise.
-    """
+    """Verify Drive is accessible (Colab only)."""
     if IN_COLAB and not DRIVE_BASE.exists():
-        logger.warning("Google Drive not mounted. Execute: drive.mount('/content/drive')")
+        logger.warning("Drive not mounted — run: drive.mount('/content/drive')")
         return False
     return True
 
 
-# =============================================================================
-# PUBLIC API
-# =============================================================================
-
 __all__ = [
-    "PROJECT_DIR",
-    "DRIVE_BASE",
-    "DRIVE_PROJECT",
-    "PATHS",
+    # Constants
+    "PROJECT_NAME", "IN_COLAB", "DVC_REMOTE_NAME",
+    # Paths
+    "PROJECT_DIR", "DRIVE_BASE", "DATA_ROOT", "MODELS_ROOT",
+    "PATHS", "DVC_STORAGE", "DVC_CONFIG", "DVC_CACHE",
+    # Functions
+    "setup_drive_symlinks", "is_dvc_initialized", "get_dvc_tracked_paths",
+    "get_path", "ensure_path", "verify_paths", "ensure_drive_mounted",
+    "configure_git_identity",
     "logger",
-    "get_path",
-    "verify_paths",
-    "ensure_drive_mounted",
-    "IN_COLAB",
-    "DVC_CONFIG",
-    "DVC_CACHE",
-    "DVC_LOCK",
-    "is_dvc_initialized",
-    "get_dvc_tracked_paths",
 ]

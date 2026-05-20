@@ -1,16 +1,21 @@
-#src/utils/colab_setup.py
+# src/utils/colab_setup.py
 
 """
 Colab environment initialization module.
 
-Provides a single entry point for setting up Google Colab runtime:
-- Mount Google Drive for persistent storage
-- Configure SSH keys for private repository access
-- Clone or update the project repository
-- Initialize DVC with Google Drive remote (persisted to Git)
-- Configure Python path and working directory
+Authentication  : SSH key stored on Google Drive (MyDrive/ssh_config/housing_key).
+DVC remote type : local path on Drive  (/content/drive/MyDrive/dvc_storage).
+                  No OAuth, no gdrive:// — Drive is already mounted as a filesystem.
 
-This module is designed to be idempotent and safe to re-run.
+Session workflow:
+  1. mount_drive()
+  2. setup_drive_symlinks()   ← data/ and models/ → Drive
+  3. configure_ssh()
+  4. clone_or_update_repo()
+  5. install_dependencies()
+  6. initialize_dvc()         ← first time: init + configure; later: no-op
+  7. dvc_pull()               ← pull data/raw from Drive remote
+  8. sys.path + os.chdir()
 """
 
 import json
@@ -22,9 +27,12 @@ from pathlib import Path
 from typing import Optional, List, Union
 
 from src.utils.logger import get_logger
-from src.utils.paths import IN_COLAB, PATHS
+from src.utils.paths import (
+    IN_COLAB, PROJECT_NAME, DRIVE_BASE,
+    DVC_REMOTE_NAME, DVC_STORAGE,
+    setup_drive_symlinks, configure_git_identity,
+)
 
-# Optional YAML support for config parsing
 try:
     import yaml
     _YAML_AVAILABLE = True
@@ -34,326 +42,423 @@ except ImportError:
 
 logger = get_logger(__name__)
 
-# ============================================================================
-# UTILITIES
-# ============================================================================
 
-def _run_command(
+# =============================================================================
+# INTERNAL HELPERS
+# =============================================================================
+
+def _run(
     cmd: str,
     cwd: Optional[Path] = None,
     silent: bool = False,
     timeout: Optional[int] = None,
 ) -> bool:
-    """Execute a shell command with error handling and optional timeout."""
+    """Run a shell command; return True on success."""
     try:
-        result = subprocess.run(
-            cmd,
-            shell=True,
+        subprocess.run(
+            cmd, shell=True,
             cwd=str(cwd) if cwd else None,
-            capture_output=True,
-            text=True,
-            errors='replace',  # Handle tricky character encodings
-            check=True,
+            capture_output=True, text=True,
+            errors="replace", check=True,
             timeout=timeout,
         )
         if not silent:
-            logger.debug(f"Command succeeded: {cmd}")
+            logger.debug(f"OK: {cmd}")
         return True
     except subprocess.TimeoutExpired:
-        if not silent:
-            logger.error(f"Command timed out: {cmd}")
+        logger.error(f"Timeout ({timeout}s): {cmd}")
         return False
     except subprocess.CalledProcessError as e:
         if not silent:
-            logger.error(f"Command failed: {cmd}\nstderr: {e.stderr}")
+            logger.error(f"FAILED: {cmd}\n  {e.stderr.strip()}")
         return False
     except Exception as e:
-        if not silent:
-            logger.error(f"Command error: {cmd}\n{type(e).__name__}: {e}")
+        logger.error(f"ERROR: {cmd} → {e}")
         return False
 
-# ============================================================================
-# CORE SETUP FUNCTIONS
-# ============================================================================
+
+def _run_out(
+    cmd: str,
+    cwd: Optional[Path] = None,
+    timeout: int = 30,
+) -> Optional[str]:
+    """Run a shell command; return stdout string or None on failure."""
+    try:
+        r = subprocess.run(
+            cmd, shell=True,
+            cwd=str(cwd) if cwd else None,
+            capture_output=True, text=True,
+            errors="replace", timeout=timeout,
+        )
+        return r.stdout.strip() if r.returncode == 0 else None
+    except Exception:
+        return None
+
+
+def _configure_git_identity(repo_path: Path, name: str, email: str) -> None:
+    """Set git user.name and user.email (prevents commit errors in Colab)."""
+    _run(f"git config user.name  '{name}'",  cwd=repo_path, silent=True)
+    _run(f"git config user.email '{email}'", cwd=repo_path, silent=True)
+
+
+# =============================================================================
+# STEP 1 — MOUNT DRIVE
+# =============================================================================
 
 def mount_drive() -> Path:
-    """Mount Google Drive if not already mounted."""
+    """Mount Google Drive and return MyDrive path."""
     drive_base = Path("/content/drive/MyDrive")
 
     if not IN_COLAB:
-        logger.warning("Not running in Colab; skipping Drive mount")
+        logger.warning("Not in Colab — skipping Drive mount")
         return drive_base
 
     if drive_base.exists():
-        logger.info("Google Drive already mounted")
+        logger.info("Drive already mounted")
         return drive_base
 
     try:
         from google.colab import drive  # type: ignore
         drive.mount("/content/drive")
-        logger.info("Google Drive mounted successfully")
+        logger.info("Drive mounted successfully")
         return drive_base
     except ImportError:
-        logger.error("google.colab not available; cannot mount Drive")
-        raise RuntimeError("Mount Drive requires Google Colab environment")
+        raise RuntimeError("google.colab not available")
     except Exception as e:
-        logger.error(f"Failed to mount Drive: {e}")
-        raise
+        raise RuntimeError(f"Drive mount failed: {e}") from e
 
-def configure_ssh(ssh_key_path: Optional[str] = None) -> bool:
-    """Configure SSH keys for GitHub authentication."""
+
+# =============================================================================
+# STEP 2 — SSH CONFIGURATION
+# =============================================================================
+
+def configure_ssh(ssh_key_path: Optional[Union[str, Path]] = None) -> bool:
+    """
+    Copy SSH private key from Drive to ~/.ssh/id_rsa.
+    Default key location: MyDrive/ssh_config/housing_key
+    """
     if not IN_COLAB:
-        logger.debug("Skipping SSH config outside Colab")
+        logger.debug("Not in Colab — skipping SSH config")
         return True
+
+    source = (
+        Path(ssh_key_path) if ssh_key_path
+        else DRIVE_BASE / "ssh_config" / "housing_key"
+    )
+
+    if not source.exists():
+        logger.error(f"SSH key not found: {source}")
+        logger.info("Fix: place your private key at MyDrive/ssh_config/housing_key")
+        return False
 
     ssh_dir = Path.home() / ".ssh"
     ssh_dir.mkdir(parents=True, exist_ok=True)
-
-    key_source = Path(ssh_key_path) if ssh_key_path else (
-        Path("/content/drive/MyDrive/ssh_config/housing_key")
-    )
-    key_dest = ssh_dir / "id_rsa"
-
-    if not key_source.exists():
-        logger.warning(f"SSH key not found: {key_source}")
-        logger.info("Falling back to HTTPS for git operations")
-        return False
+    dest = ssh_dir / "id_rsa"
 
     try:
-        shutil.copy2(key_source, key_dest)
-        key_dest.chmod(0o600)
-        _run_command(
-            "ssh-keyscan -H github.com >> ~/.ssh/known_hosts 2>/dev/null",
-            silent=True
-        )
-        logger.info("SSH keys configured successfully")
+        shutil.copy2(source, dest)
+        dest.chmod(0o600)
+        _run("ssh-keyscan -H github.com >> ~/.ssh/known_hosts 2>/dev/null",
+             silent=True, timeout=15)
+        logger.info("SSH configured successfully")
         return True
     except Exception as e:
-        logger.error(f"Failed to configure SSH: {e}")
+        logger.error(f"SSH config failed: {e}")
         return False
 
-def clone_or_update_repo(repo_url: str, target_path: Path, use_ssh: bool = True) -> bool:
-    """Clone repository if absent, or pull latest changes if present."""
-    if target_path.exists():
-        logger.info(f"Repository exists at {target_path}; pulling updates...")
-        success = _run_command("git pull --rebase", cwd=target_path)
-        if success:
-            logger.info("Repository updated successfully")
-        return success
 
-    logger.info(f"Cloning repository to {target_path}...")
-    git_url = repo_url
-    if use_ssh and "github.com" in repo_url and "git@github.com" not in repo_url:
-        parts = repo_url.rstrip(".git").replace("https://github.com/", "")
-        git_url = f"git@github.com:{parts}.git"
-        logger.debug(f"Using SSH URL: {git_url}")
+# =============================================================================
+# STEP 3 — CLONE / UPDATE REPO
+# =============================================================================
 
-    success = _run_command(f"git clone {git_url} {target_path}")
-    if success:
-        logger.info(f"Repository cloned successfully to {target_path}")
-    return success
+def clone_or_update_repo(
+    repo_owner: str,
+    repo_name: str,
+    repo_path: Path,
+    ssh_configured: bool = True,
+) -> bool:
+    """Clone via SSH (or HTTPS fallback); pull if repo already exists."""
+    url = (
+        f"git@github.com:{repo_owner}/{repo_name}.git"
+        if ssh_configured
+        else f"https://github.com/{repo_owner}/{repo_name}.git"
+    )
 
-def configure_python_path(repo_path: Path) -> None:
-    """Add repository to sys.path for module imports."""
-    repo_str = str(repo_path.resolve())
-    if repo_str not in sys.path:
-        sys.path.insert(0, repo_str)
-        logger.debug(f"Added to sys.path: {repo_str}")
+    if (repo_path / ".git").exists():
+        logger.info(f"Repo exists — updating via {url}")
+        ok = _run("git pull --rebase", cwd=repo_path, timeout=120)
+        if ok:
+            logger.info("Repo updated")
+        return ok
 
-def set_working_directory(repo_path: Path) -> None:
-    """Change current working directory to project root."""
-    os.chdir(repo_path)
-    logger.debug(f"Working directory set to: {repo_path}")
+    logger.info(f"Cloning {url} → {repo_path}")
+    ok = _run(f"git clone {url} {repo_path}", timeout=180)
+    if ok:
+        logger.info("Repo cloned successfully")
+    return ok
 
-def install_dependencies(requirements_file: Optional[Union[str, Path]] = None) -> bool:
-    """Install Python dependencies from requirements file."""
+
+# =============================================================================
+# STEP 4 — DEPENDENCIES
+# =============================================================================
+
+def install_dependencies(req_file: Optional[Union[str, Path]] = None) -> bool:
+    """Install pip requirements (Colab only)."""
     if not IN_COLAB:
-        logger.debug("Skipping dependency installation outside Colab")
+        logger.debug("Skipping dependency install outside Colab")
         return True
 
-    req_path = Path(requirements_file) if requirements_file else Path("requirements.txt")
-    if not req_path.exists():
-        logger.warning(f"Requirements file not found: {req_path}; skipping installation")
+    req = Path(req_file) if req_file else Path("requirements.txt")
+    if not req.exists():
+        logger.warning(f"requirements.txt not found: {req} — skipping")
         return True
 
-    logger.info(f"Installing dependencies from {req_path}...")
-    success = _run_command(f"pip install -q -r {req_path}", timeout=300)
-    if success:
-        logger.info("Dependencies installed successfully")
-    return success
+    logger.info("Installing dependencies…")
+    ok = _run(f"pip install -q -r {req}", timeout=300)
+    if ok:
+        logger.info("Dependencies installed")
+    return ok
 
-# ============================================================================
-# DVC INTEGRATION (Google Drive Remote)
-# ============================================================================
+
+# =============================================================================
+# STEP 5 — DVC INITIALIZATION
+# =============================================================================
 
 def _ensure_dvc_installed(repo_path: Path) -> bool:
-    """Install DVC with Google Drive support if not present."""
+    """Install DVC (plain, no gdrive extra — remote is local path on Drive)."""
     try:
-        result = subprocess.run(
-            "which dvc >/dev/null 2>&1 || pip install -q 'dvc[gdrive]'",
-            shell=True, cwd=str(repo_path), capture_output=True, text=True, errors='replace', timeout=120
+        r = subprocess.run(
+            "which dvc >/dev/null 2>&1 || pip install -q dvc",
+            shell=True, cwd=str(repo_path),
+            capture_output=True, text=True,
+            errors="replace", timeout=180,
         )
-        return result.returncode == 0
+        return r.returncode == 0
     except Exception as e:
-        logger.error(f"Failed to install DVC: {e}")
+        logger.error(f"DVC install failed: {e}")
         return False
+
 
 def initialize_dvc(
     repo_path: Path,
-    remote_id: Optional[str] = None,
-    git_user_name: str = "Colab Automation Bot",
-    git_user_email: str = "colab-bot@developer.com",
+    git_user_name:  str = "Colab Bot",
+    git_user_email: str = "colab@bot.local",
 ) -> bool:
-    """Initialize DVC repository and configure Google Drive remote."""
-    try:
-        if not _ensure_dvc_installed(repo_path):
-            logger.error("Failed to install DVC")
-            return False
-
-        dvc_dir = repo_path / ".dvc"
-        
-        # Only setup config and git identity if DVC is NOT initialized
-        if not dvc_dir.exists():
-            logger.info("Initializing DVC repository (First-time setup)...")
-            if not _run_command("dvc init", cwd=repo_path, timeout=60):
-                logger.error("Failed to run 'dvc init'")
-                return False
-            
-            if remote_id:
-                logger.info(f"Configuring DVC remote to Google Drive: {remote_id}")
-                if not _run_command(f"dvc remote add -d -f mydrive gdrive://{remote_id}", cwd=repo_path, timeout=60):
-                    logger.error("Failed to add DVC remote")
-                    return False
-                
-                _run_command("dvc remote modify mydrive gdrive_use_service_account false", cwd=repo_path, silent=True)
-            
-            logger.info("Persisting DVC configuration to GitHub...")
-            _run_command(f"git config user.email '{git_user_email}'", cwd=repo_path, silent=True)
-            _run_command(f"git config user.name '{git_user_name}'", cwd=repo_path, silent=True)
-            # Add entire .dvc folder to prevent failure if .dvcignore is missing
-            _run_command("git add .dvc/", cwd=repo_path, silent=True)
-            
-            status = subprocess.run("git status --porcelain", shell=True, cwd=repo_path, capture_output=True, text=True, errors='replace', timeout=30)
-            if status.stdout.strip():
-                _run_command("git commit -m 'chore: initialize DVC with Google Drive remote'", cwd=repo_path, timeout=60)
-                push_success = _run_command("git push", cwd=repo_path, timeout=120)
-                if not push_success:
-                    _run_command("git push -u origin HEAD", cwd=repo_path, timeout=120)
-            
-            logger.info("✅ DVC setup completed and persisted to GitHub")
-        else:
-            logger.info("✅ DVC already initialized (config loaded from GitHub)")
-        
+    """
+    First time → dvc init + cache on Drive + local remote on Drive + git push
+    Subsequent → .dvc/ already cloned from GitHub → just verify DVC installed
+    """
+    if not IN_COLAB:
+        logger.debug("Not in Colab — skipping DVC init")
         return True
-    except Exception as e:
-        logger.error(f"Failed to initialize DVC: {type(e).__name__}: {e}")
+
+    if not _ensure_dvc_installed(repo_path):
+        logger.error("DVC installation failed")
         return False
 
-def dvc_pull(targets: Optional[List[str]] = None, repo_path: Optional[Path] = None, force: bool = False, timeout: int = 300) -> bool:
-    """Pull data from DVC remote storage."""
-    try:
-        cwd = repo_path or Path.cwd()
-        cmd_parts = ["dvc", "pull"]
-        if force:
-            cmd_parts.append("--force")
-        if targets:
-            cmd_parts.extend(targets)
-        
-        cmd = " ".join(cmd_parts)
-        logger.info(f"Pulling data from DVC remote: {' '.join(targets or ['all'])}")
-        return _run_command(cmd, cwd=cwd, timeout=timeout)
-    except Exception as e:
-        logger.error(f"DVC pull failed: {e}")
+    if (repo_path / ".dvc").exists():
+        logger.info("✅ DVC already initialized (config from GitHub)")
+        return True
+
+    logger.info("First-time DVC initialization…")
+
+    # 1. dvc init
+    if not _run("dvc init", cwd=repo_path, timeout=60):
+        logger.error("dvc init failed")
         return False
+
+    # 2. DVC cache on Drive (survives session restarts — no re-download needed)
+    drive_cache = DRIVE_BASE / f"{PROJECT_NAME}_dvc_cache"
+    drive_cache.mkdir(parents=True, exist_ok=True)
+    _run(f"dvc cache dir '{drive_cache}'",  cwd=repo_path)
+    _run("dvc config cache.type symlink",   cwd=repo_path)
+    _run("dvc config cache.protected true", cwd=repo_path)
+    logger.info(f"DVC cache → {drive_cache}")
+
+    # 3. DVC remote = local path on Drive (no OAuth, no internet for push/pull)
+    DVC_STORAGE.mkdir(parents=True, exist_ok=True)
+    if not _run(
+        f"dvc remote add -d -f {DVC_REMOTE_NAME} '{DVC_STORAGE}'",
+        cwd=repo_path, timeout=30,
+    ):
+        logger.error("Failed to add DVC remote")
+        return False
+    logger.info(f"DVC remote '{DVC_REMOTE_NAME}' → {DVC_STORAGE}")
+
+    # 4. Commit .dvc/config to GitHub (so next session clones it automatically)
+    configure_git_identity(repo_path)
+    _run("git add .dvc/config .dvcignore", cwd=repo_path, silent=True)
+
+    has_changes = bool(_run_out("git status --porcelain", cwd=repo_path))
+    if has_changes:
+        _run(
+            "git commit -m 'chore: initialize DVC with Drive local remote'",
+            cwd=repo_path, timeout=60,
+        )
+        ok = _run("git push", cwd=repo_path, timeout=120)
+        if not ok:
+            ok = _run("git push -u origin HEAD", cwd=repo_path, timeout=120)
+        if ok:
+            logger.info("✅ .dvc/config pushed to GitHub")
+        else:
+            logger.error(
+                "git push FAILED.\n"
+                "Check: GitHub → Settings → SSH keys has Read/Write scope."
+            )
+            return False
+    else:
+        logger.info("No git changes to commit")
+
+    logger.info("✅ DVC initialized successfully")
+    return True
+
+
+# =============================================================================
+# STEP 6 — DVC PULL / STATUS
+# =============================================================================
+
+def dvc_pull(
+    targets: Optional[List[str]] = None,
+    repo_path: Optional[Path] = None,
+    force: bool = False,
+    timeout: int = 300,
+) -> bool:
+    """
+    Pull DVC-tracked files from Drive local remote.
+    Default targets: ["data/raw"]  — avoids pulling unfinished interim/processed.
+    """
+    cwd = repo_path or Path.cwd()
+
+    # Safe default: pull only raw data, not everything
+    effective_targets = targets if targets is not None else ["data/raw"]
+
+    parts = ["dvc", "pull", f"--remote={DVC_REMOTE_NAME}"]
+    if force:
+        parts.append("--force")
+    parts.extend(effective_targets)
+
+    cmd = " ".join(parts)
+    logger.info(f"DVC pull: {effective_targets}")
+    ok = _run(cmd, cwd=cwd, timeout=timeout)
+
+    if ok:
+        logger.info("✅ DVC pull complete")
+    else:
+        logger.warning(
+            "⚠️  DVC pull had warnings — this is normal on the very first run "
+            "(no data pushed yet). Run ingestion to download and push data."
+        )
+    return ok
+
 
 def dvc_status(repo_path: Optional[Path] = None) -> Optional[dict]:
-    """Get DVC status for tracked data."""
+    """Return DVC status as dict, or None on failure."""
+    out = _run_out("dvc status --json", cwd=repo_path or Path.cwd(), timeout=60)
     try:
-        cwd = repo_path or Path.cwd()
-        result = subprocess.run("dvc status --json", shell=True, cwd=str(cwd), capture_output=True, text=True, errors='replace', check=True, timeout=60)
-        return json.loads(result.stdout)
-    except Exception as e:
-        logger.warning(f"Could not get DVC status: {e}")
+        return json.loads(out) if out else None
+    except json.JSONDecodeError:
         return None
 
-# ============================================================================
+
+# =============================================================================
 # MAIN ENTRY POINT
-# ============================================================================
+# =============================================================================
 
 def initialize_environment(
-    repo_name: str = "california_housing_full_project",
-    repo_owner: Optional[str] = None,
-    use_ssh: bool = True,
-    install_deps: bool = True,
-    dvc_remote_id: Optional[str] = None,
-    dvc_auto_pull: bool = True,
-    dvc_pull_targets: Optional[List[str]] = None,
-    dvc_force_pull: bool = False,
-    git_user_name: str = "Colab Automation Bot",
-    git_user_email: str = "colab-bot@developer.com",
+    repo_name:        str = PROJECT_NAME,
+    repo_owner:       Optional[str] = None,
+    ssh_key_path:     Optional[Union[str, Path]] = None,
+    install_deps:     bool = True,
+    dvc_auto_pull:    bool = True,
+    dvc_pull_targets: Optional[List[str]] = None,   # None → ["data/raw"]
+    dvc_force_pull:   bool = False,
+    git_user_name:    str = "Colab Bot",
+    git_user_email:   str = "colab@bot.local",
 ) -> Path:
-    """Main entry point: Initialize complete Colab environment."""
-    
+    """
+    Full Colab session bootstrap.
+
+    Usage (every session, top of your notebook):
+        from src.utils.colab_setup import initialize_environment
+        repo_path = initialize_environment(repo_owner="ebramrafat653-wq")
+
+    Returns:
+        Path to /content/<repo_name>
+    """
     if repo_owner is None:
-        repo_owner = os.environ.get("GITHUB_REPO_OWNER", "ebramrafat653-wq")
+        repo_owner = os.environ.get("GITHUB_REPO_OWNER")
+        if not repo_owner:
+            raise ValueError(
+                "repo_owner is required. "
+                "Pass it explicitly or set the GITHUB_REPO_OWNER env var."
+            )
 
-    logger.info(f"Initializing Colab environment for '{repo_name}'...")
+    logger.info("=" * 60)
+    logger.info(f"  Colab Setup: {repo_owner}/{repo_name}")
+    logger.info("=" * 60)
 
-    drive_base = mount_drive()
-    ssh_configured = configure_ssh() if use_ssh else False
+    # 1. Mount Drive
+    mount_drive()
 
-    https_url = f"https://github.com/{repo_owner}/{repo_name}.git"
-    repo_url = f"git@github.com:{repo_owner}/{repo_name}.git" if use_ssh and ssh_configured else https_url
+    # 2. Symlinks (data/ and models/ → Drive) — BEFORE clone so paths exist
+    setup_drive_symlinks()
 
+    # 3. SSH
+    ssh_ok = configure_ssh(ssh_key_path)
+    if not ssh_ok:
+        logger.warning("SSH unavailable — falling back to HTTPS (git push will fail)")
+
+    # 4. Clone / pull repo
     repo_path = Path(f"/content/{repo_name}")
-    if not clone_or_update_repo(repo_url, repo_path, use_ssh=use_ssh and ssh_configured):
-        logger.error("Failed to clone/update repository")
-        raise RuntimeError("Repository setup failed")
+    if not clone_or_update_repo(repo_owner, repo_name, repo_path, ssh_ok):
+        raise RuntimeError("Repository clone/update failed")
 
+    # 5. Dependencies
     if install_deps:
         install_dependencies(repo_path / "requirements.txt")
 
-    # Auto-load DVC remote ID from config if not provided
-    if dvc_remote_id is None and _YAML_AVAILABLE:
-        config_path = PATHS.get("configs", repo_path / "configs") / "data_config.yaml"
-        if config_path.exists():
-            try:
-                with open(config_path, "r", encoding="utf-8") as f:
-                    config = yaml.safe_load(f)
-                dvc_remote_id = config.get("dvc", {}).get("remote", {}).get("gdrive_id")
-                if dvc_remote_id:
-                    logger.info(f"Auto-loaded DVC remote ID from config: {dvc_remote_id}")
-            except Exception as e:
-                logger.warning(f"Could not load DVC remote ID from config: {e}")
+    # 6. DVC init
+    dvc_ok = initialize_dvc(
+        repo_path,
+        git_user_name=git_user_name,
+        git_user_email=git_user_email,
+    )
 
-    if dvc_remote_id:
-        logger.info("Setting up DVC integration...")
-        if initialize_dvc(repo_path, remote_id=dvc_remote_id, git_user_name=git_user_name, git_user_email=git_user_email):
-            if dvc_auto_pull:
-                logger.info("Auto-pulling DVC-tracked data...")
-                success = dvc_pull(targets=dvc_pull_targets, repo_path=repo_path, force=dvc_force_pull, timeout=300)
-                if success:
-                    logger.info("✅ DVC data pulled successfully")
-                else:
-                    logger.warning("⚠️ DVC pull completed with warnings")
-        else:
-            logger.warning("⚠️ DVC initialization failed; continuing without DVC")
+    # 7. DVC pull
+    if dvc_ok and dvc_auto_pull:
+        dvc_pull(
+            targets=dvc_pull_targets,   # defaults to ["data/raw"] inside dvc_pull
+            repo_path=repo_path,
+            force=dvc_force_pull,
+        )
 
-    configure_python_path(repo_path)
-    set_working_directory(repo_path)
+    # 8. Python path + working directory
+    if str(repo_path) not in sys.path:
+        sys.path.insert(0, str(repo_path))
+    os.chdir(repo_path)
+
+    # ── Status summary ────────────────────────────────────────────
+    dvc_ready    = (repo_path / ".dvc").exists()
+    kaggle_ready = (Path.home() / ".kaggle" / "kaggle.json").exists()
 
     logger.info("=" * 60)
-    logger.info("✅ ENVIRONMENT READY")
-    logger.info(f"📍 Working directory: {os.getcwd()}")
-    logger.info(f"📚 Project path: {sys.path[0]}")
-    logger.info(f"🗂️ DVC: {'✅ Configured' if (repo_path / '.dvc').exists() else '⚪ Not set'}")
-    logger.info(f"🔐 Kaggle: {'✅ Ready' if (Path.home() / '.kaggle' / 'kaggle.json').exists() else '⚪ Not configured'}")
+    logger.info("  ✅ ENVIRONMENT READY")
+    logger.info(f"  📍 Working dir : {os.getcwd()}")
+    logger.info(f"  🗂️  DVC         : {'✅ configured' if dvc_ready    else '⚪ not set'}")
+    logger.info(f"  🔐 Kaggle      : {'✅ ready'      if kaggle_ready  else '⚪ not configured'}")
+    logger.info(f"  💾 DVC remote  : {DVC_REMOTE_NAME} → {DVC_STORAGE}")
     logger.info("=" * 60)
 
     return repo_path
 
+
 __all__ = [
-    "initialize_environment", "mount_drive", "configure_ssh", "clone_or_update_repo",
-    "install_dependencies", "configure_python_path", "set_working_directory",
-    "initialize_dvc", "dvc_pull", "dvc_status",
+    "initialize_environment",
+    "mount_drive",
+    "configure_ssh",
+    "clone_or_update_repo",
+    "install_dependencies",
+    "initialize_dvc",
+    "dvc_pull",
+    "dvc_status",
 ]
