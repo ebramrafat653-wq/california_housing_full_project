@@ -12,7 +12,8 @@
 dataset:
   name: "california_housing"
   source: "kaggle"
-  kaggle_id: "saraferguswps/california-housing"
+  kaggle_id: "camnugent/california-housing-prices"
+
 
   # Files expected after download/unzip (used by verify_download_integrity)
   expected_files:

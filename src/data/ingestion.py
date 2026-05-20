@@ -290,7 +290,7 @@ def track_with_dvc(
         logger.warning(f"dvc push warnings:\n{push.stderr.strip()}")
 
     # git: add .dvc pointer + .gitignore → commit → push
-    _ensure_git_identity(PROJECT_DIR)
+    configure_git_identity(PROJECT_DIR)
     subprocess.run(
         ["git", "add", f"{rel}.dvc", str(rel.parent / ".gitignore")],
         cwd=PROJECT_DIR, capture_output=True,
