@@ -1,0 +1,8 @@
+[cache]
+    dir = /content/drive/MyDrive/california_housing_full_project_dvc_cache
+    type = symlink
+    protected = true
+[core]
+    remote = mylocal
+['remote "mylocal"']
+    url = /content/drive/MyDrive/dvc_storage
