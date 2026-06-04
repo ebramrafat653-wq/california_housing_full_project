@@ -1,5 +1,3 @@
-#configs/data_config.yaml
-
 # =============================================================================
 # California Housing Project — Data Configuration
 # Compatible with: Linux, macOS, Windows, Google Colab
@@ -13,7 +11,6 @@ dataset:
   name: "california_housing"
   source: "kaggle"
   kaggle_id: "camnugent/california-housing-prices"
-
 
   # Files expected after download/unzip (used by verify_download_integrity)
   expected_files:
@@ -37,12 +34,13 @@ project:
   description: "Predict median house value in California districts using census data"
 
 # -----------------------------------------------------------------------------
-# DATA VALIDATION RULES
+# DATA VALIDATION RULES (UPDATED FROM PROFILING)
 # -----------------------------------------------------------------------------
 validation:
   max_missing_ratio: 0.3
   min_rows: 100
   min_columns: 5
+  allow_fully_null_columns: false
 
   required_columns:
     - "longitude"
@@ -56,7 +54,37 @@ validation:
     - "ocean_proximity"
     - "median_house_value"
 
-  allow_fully_null_columns: false
+  # 1. Null Rules: Only these columns are allowed to have missing values
+  allowed_null_columns:
+    - "total_bedrooms"
+
+  # 2. Categorical Rules: Strict adherence to known categories
+  categorical_features:
+    ocean_proximity: 
+      - "NEAR BAY"
+      - "<1H OCEAN"
+      - "INLAND"
+      - "NEAR OCEAN"
+      - "ISLAND"
+
+  # 3. Numeric Boundaries: Catch data drift or corrupted inputs
+  # Extracted from the profiling min/max bounds
+  numeric_boundaries:
+    longitude:
+      min: -124.35
+      max: -114.0
+    latitude:
+      min: 32.0
+      max: 42.0
+    housing_median_age:
+      min: 1.0
+      max: 52.0  # Note: Capped value
+    median_house_value:
+      min: 14999.0
+      max: 500001.0 # Note: Capped value
+    median_income:
+      min: 0.0
+      max: 16.0
 
 # -----------------------------------------------------------------------------
 # TRAIN/TEST SPLIT
@@ -69,32 +97,22 @@ split:
 # -----------------------------------------------------------------------------
 # DVC CONFIGURATION
 # -----------------------------------------------------------------------------
-# Remote type: local path on Google Drive (Drive is mounted in Colab, so
-# dvc push/pull work like a local filesystem — no OAuth, no internet needed).
-#
-# Remote path on Drive: MyDrive/dvc_storage/
-# DVC cache  on Drive: MyDrive/california_housing_full_project_dvc_cache/
-# -----------------------------------------------------------------------------
 dvc:
   enabled: true
-
   remote:
     name: "mylocal"                 
     type: "local"                   
     default: true
-
   tracked_paths:
     - "data/raw"
     - "data/interim"
     - "data/processed"
     - "models"
-
   auto_pull:
     enabled: true
     force: false
     targets:
       - "data/raw"                 
-
   cache:
     type: "symlink"                
-    protected: true                
+    protected: true
