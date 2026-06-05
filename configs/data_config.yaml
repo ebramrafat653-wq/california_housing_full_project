@@ -90,7 +90,8 @@ validation:
 # TRAIN/TEST SPLIT
 # -----------------------------------------------------------------------------
 split:
-  test_size: 0.2
+  val_size: 0.15      
+  test_size: 0.15     
   random_state: 42
   shuffle: true
 
