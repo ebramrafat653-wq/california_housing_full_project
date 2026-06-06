@@ -221,8 +221,8 @@ def stratified_split(
     1. Bin `target` into `n_bins` quantile-based strata.
     2. Split off `test_size` as test — stratified on bins.
     3. Split the remainder into train / val — stratified on bins.
-    4. Verify and log per-stratum distributions.
-    5. Drop the helper strata column from all three sets.
+    4. Drop the helper strata column from all three sets.
+    5. Verify and log per-stratum distributions.
 
     Args:
         df           : Full cleaned DataFrame (post-validation, pre-EDA).
@@ -279,7 +279,8 @@ def stratified_split(
         stratify=temp_df[_STRATA_COL],
     )
 
-    # ── Step 4: Initialize Result & Verify (BEFORE dropping column) ───────────
+    # ── Step 4: Verify before dropping ───────────────────────────────────────
+    # _verify_stratification needs _STRATA_COL → must run BEFORE drop
     total = len(train_df) + len(val_df) + len(test_df)
     result = SplitResult(
         train=train_df,
@@ -291,24 +292,20 @@ def stratified_split(
         n_bins=n_bins,
         random_state=random_state,
     )
-    
-    # Verify distributions using the dataframes that still have _STRATA_COL
+
     _verify_stratification(df_strat, train_df, val_df, test_df, result)
 
-    # ── Step 5: Drop helper column ────────────────────────────────────────────
-    for split in (train_df, val_df, test_df):
-        split.drop(columns=[_STRATA_COL], inplace=True)
-
-    # ── Step 6: Reset indices & Update Result ─────────────────────────────────
-    result.train = train_df.reset_index(drop=True)
-    result.val   = val_df.reset_index(drop=True)
-    result.test  = test_df.reset_index(drop=True)
+    # ── Step 5: Drop helper column (reassign — inplace unsafe on split slices) ─
+    result.train = train_df.drop(columns=[_STRATA_COL]).reset_index(drop=True)
+    result.val   = val_df.drop(columns=[_STRATA_COL]).reset_index(drop=True)
+    result.test  = test_df.drop(columns=[_STRATA_COL]).reset_index(drop=True)
 
     logger.info(
         f"Split complete — "
         f"train: {len(result.train):,} | val: {len(result.val):,} | test: {len(result.test):,}"
     )
     return result
+
 
 # =============================================================================
 # SAVE TO DISK (data/interim/)
