@@ -1,4 +1,4 @@
-#tests/conftest.py
+# tests/conftest.py
 
 """
 Pytest configuration and shared fixtures for the California Housing project.
@@ -14,6 +14,8 @@ import sys
 from pathlib import Path
 from typing import Iterator, Optional
 
+import numpy as np
+import pandas as pd
 import pytest
 
 from src.utils.logger import get_logger, setup_logging
@@ -129,15 +131,12 @@ def test_data_dir(project_root: Path) -> Path:
 
 
 @pytest.fixture(scope="function")
-def sample_california_housing_df() -> "pd.DataFrame":
+def sample_california_housing_df() -> pd.DataFrame:
     """
     Provide a minimal valid California Housing DataFrame for testing.
     Matches the Kaggle schema and includes intentional flaws (NaNs, Outliers) 
     to test the DataCleaner.
     """
-    import pandas as pd
-    import numpy as np
-
     data = {
         "longitude": [-122.23, -122.22, -122.24],
         "latitude": [37.88, 37.86, 37.85],
@@ -152,20 +151,16 @@ def sample_california_housing_df() -> "pd.DataFrame":
     }
     return pd.DataFrame(data)
 
-@pytest.fixture(scope="function")
-def empty_df() -> "pd.DataFrame":
-    """Provide an empty DataFrame for edge-case testing."""
-    import pandas as pd
 
+@pytest.fixture(scope="function")
+def empty_df() -> pd.DataFrame:
+    """Provide an empty DataFrame for edge-case testing."""
     return pd.DataFrame()
 
 
 @pytest.fixture(scope="function")
-def df_with_null_columns() -> "pd.DataFrame":
+def df_with_null_columns() -> pd.DataFrame:
     """Provide a DataFrame containing fully null columns for validation testing."""
-    import pandas as pd
-    import numpy as np
-
     return pd.DataFrame({
         "valid_col": [1, 2, 3],
         "null_col": [None, None, None],
@@ -205,16 +200,44 @@ def mock_config_yaml(tmp_path: Path) -> Path:
         Path: Path to the mock YAML config file.
     """
     config_content = """
+project:
+  name: "CaliforniaHousing"
+  target: "median_house_value"
+
 dataset:
   kaggle_id: "test/test-dataset"
   expected_files:
     - "test.csv"
+  raw_path: "data/raw"
+  interim_path: "data/interim"
+
 validation:
   min_rows: 10
+  min_cols: 2
+  required_columns:
+    - "longitude"
+    - "latitude"
+    - "median_house_value"
 """
     config_file = tmp_path / "test_config.yaml"
     config_file.write_text(config_content, encoding="utf-8")
     return config_file
+
+
+@pytest.fixture(scope="function")
+def skewed_mock_df() -> pd.DataFrame:
+    """
+    Provide a DataFrame with heavily right-skewed numerical features 
+    specifically for testing transformations like log1p.
+    """
+    np.random.seed(42)
+
+    return pd.DataFrame({
+        "total_rooms": np.random.lognormal(mean=4.0, sigma=1.0, size=1000),
+        "total_bedrooms": np.random.lognormal(mean=3.0, sigma=0.8, size=1000),
+        "population": np.random.lognormal(mean=4.5, sigma=1.2, size=1000),
+        "households": np.random.lognormal(mean=3.5, sigma=0.9, size=1000),
+    })
 
 
 # =============================================================================
@@ -235,7 +258,6 @@ def mock_dvc_remote(tmp_path: Path) -> Path:
     """Create a temporary local DVC remote for testing."""
     remote_dir = tmp_path / "dvc_remote"
     remote_dir.mkdir()
-    # Could mock dvc commands here with monkeypatch
     return remote_dir
 
 
