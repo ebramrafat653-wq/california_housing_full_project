@@ -1,7 +1,10 @@
 # =============================================================================
 # California Housing Project — Data Configuration
 # Compatible with: Linux, macOS, Windows, Google Colab
-# Used by: src/data/ingestion.py, src/data/validation.py, src/utils/colab_setup.py
+# Used by: src/data/ingestion.py, src/data/validation.py, src/data/cleaning.py,
+#          src/utils/colab_setup.py
+#
+# UPDATED AFTER EDA (notebooks/03_eda.ipynb) — train.csv, 14,448 rows
 # =============================================================================
 
 # -----------------------------------------------------------------------------
@@ -34,7 +37,7 @@ project:
   description: "Predict median house value in California districts using census data"
 
 # -----------------------------------------------------------------------------
-# DATA VALIDATION RULES (UPDATED FROM PROFILING)
+# DATA VALIDATION RULES (Phase 1 — from profiling, used by validation.py)
 # -----------------------------------------------------------------------------
 validation:
   max_missing_ratio: 0.3
@@ -60,7 +63,7 @@ validation:
 
   # 2. Categorical Rules: Strict adherence to known categories
   categorical_features:
-    ocean_proximity: 
+    ocean_proximity:
       - "NEAR BAY"
       - "<1H OCEAN"
       - "INLAND"
@@ -68,7 +71,7 @@ validation:
       - "ISLAND"
 
   # 3. Numeric Boundaries: Catch data drift or corrupted inputs
-  # Extracted from the profiling min/max bounds
+  # Extracted from the profiling min/max bounds (hard limits, not outlier detection)
   numeric_boundaries:
     longitude:
       min: -124.35
@@ -87,13 +90,120 @@ validation:
       max: 16.0
 
 # -----------------------------------------------------------------------------
-# TRAIN/TEST SPLIT
+# EDA-DERIVED VALUES (Phase 2 — from notebooks/03_eda.ipynb on train.csv only)
+# These feed validation.py phase 2, cleaning.py, and feature_engineering.py.
+# Source: train set, 14,448 rows. Re-run EDA and update this section if the
+# split or raw data changes significantly.
+# -----------------------------------------------------------------------------
+eda_derived:
+
+  # --- Missingness analysis (Section 3) ---------------------------------------
+  # Welch t-test (numeric) + chi-square (categorical) against total_bedrooms.isnull()
+  missingness:
+    total_bedrooms:
+      missing_pct: 0.969
+      chi2_pvalue_vs_ocean_proximity: 0.3095
+      mechanism: "MCAR"              # p >= 0.05 -> not related to ocean_proximity
+      imputation_strategy: "global_median"   # MCAR -> simple global median is valid
+
+  # --- Target distribution (Section 4) -----------------------------------------
+  target_summary:
+    skewness_raw: 0.982
+    skewness_log1p: null             # not computed in this run — log1p still recommended
+    pct_capped: 4.727
+    n_capped: 683
+    cap_threshold: 500001.0
+    transform: "log1p"
+    capped_flag_column: "is_capped"
+
+  # --- IQR outlier boundaries (Section 8) ----------------------------------------
+  # Q1 - 1.5*IQR / Q3 + 1.5*IQR on train set. Used for soft outlier flags
+  # and validation.py phase 2 — NOT for dropping rows.
+  iqr_bounds:
+    longitude:
+      lower: -127.51
+      upper: -112.31
+    latitude:
+      lower: 28.245
+      upper: 43.405
+    housing_median_age:
+      lower: -10.5
+      upper: 65.5
+    total_rooms:
+      lower: -1098.375
+      upper: 5686.625
+    total_bedrooms:
+      lower: -232.5
+      upper: 1171.5
+    population:
+      lower: -622.375
+      upper: 3130.625
+    households:
+      lower: -209.5
+      upper: 1090.5
+    median_income:
+      lower: -0.7188
+      upper: 8.0312
+
+  # --- Multicollinearity check (Section 7) ---------------------------------------
+  # VIF on engineered ratios + median_income. All < 10 -> no feature dropped.
+  vif_scores:
+    rooms_per_household: 5.459
+    bedrooms_per_room: 3.476
+    population_per_household: 1.074
+    median_income: 4.564
+  vif_threshold_drop: 10.0
+  vif_threshold_watch: 5.0
+
+  # --- LOF multivariate outlier detection (Section 8) ------------------------------
+  lof:
+    contamination: 0.02
+    n_neighbors: 20
+    features:
+      - "median_income"
+      - "total_rooms"
+      - "population"
+      - "households"
+      - "longitude"
+      - "latitude"
+    n_outliers_detected: 289
+    pct_outliers: 2.00
+    novelty: true                    # allows .predict() on val/test without refitting
+
+  # --- Feature transformation decisions (-> cleaning.py) ---------------------------
+  log1p_columns:
+    - "total_rooms"
+    - "total_bedrooms"
+    - "population"
+    - "households"
+  no_transform_columns:
+    - "median_income"               # not a count variable; use RobustScaler for linear models
+
+  # --- Feature engineering candidates (-> feature_engineering.py) ------------------
+  engineered_features:
+    ratios:
+      rooms_per_household: "total_rooms / households"
+      bedrooms_per_room: "total_bedrooms / total_rooms"
+      population_per_household: "population / households"
+    distances:
+      dist_SF: {lat: 37.77, lon: -122.42}
+      dist_LA: {lat: 34.05, lon: -118.24}
+    drop_after_engineering:
+      - "total_rooms"
+      - "total_bedrooms"
+      - "population"
+      - "households"
+
+# -----------------------------------------------------------------------------
+# TRAIN/VAL/TEST SPLIT
 # -----------------------------------------------------------------------------
 split:
-  val_size: 0.15      
-  test_size: 0.15     
+  val_size: 0.15
+  test_size: 0.15
   random_state: 42
   shuffle: true
+  strategy: "stratified"             # stratified on quantile-binned target
+  n_strata_bins: 5
 
 # -----------------------------------------------------------------------------
 # DVC CONFIGURATION
@@ -101,8 +211,8 @@ split:
 dvc:
   enabled: true
   remote:
-    name: "mylocal"                 
-    type: "local"                   
+    name: "mylocal"
+    type: "local"
     default: true
   tracked_paths:
     - "data/raw"
@@ -113,7 +223,7 @@ dvc:
     enabled: true
     force: false
     targets:
-      - "data/raw"                 
+      - "data/raw"
   cache:
-    type: "symlink"                
+    type: "symlink"
     protected: true
