@@ -20,8 +20,9 @@ import pytest
 
 from src.utils.logger import get_logger, setup_logging
 
-logger = get_logger(__name__)
+setup_logging(level=logging.INFO)
 
+logger = get_logger(__name__)
 
 def resolve_project_root(
     candidates: Optional[list[Path]] = None,
