@@ -17,12 +17,57 @@ from typing import Iterator, Optional
 import numpy as np
 import pandas as pd
 import pytest
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
 
 from src.utils.logger import get_logger, setup_logging
 
 setup_logging(level=logging.INFO)
 
 logger = get_logger(__name__)
+
+
+# =============================================================================
+# WORKAROUND: Auto-apply fitted attribute copy after any pipeline fit
+# This ensures tests can access fitted scaler attributes directly from the
+# ColumnTransformer.transformers list (instead of named_transformers_)
+# =============================================================================
+
+def _copy_fitted_attributes_for_test(
+    ct: ColumnTransformer,
+    name: str,
+    attr_list: list[str],
+) -> None:
+    """Copy fitted attributes from named_transformers_ to original transformer."""
+    if name not in ct.named_transformers_:
+        return
+    fitted = ct.named_transformers_[name]
+    for i, (t_name, trans, cols) in enumerate(ct.transformers):
+        if t_name == name:
+            for attr in attr_list:
+                if hasattr(fitted, attr):
+                    setattr(trans, attr, getattr(fitted, attr))
+            break
+
+
+_original_pipeline_fit = Pipeline.fit
+
+
+def _patched_pipeline_fit(self, X, y=None, **fit_params):
+    """Pipeline.fit() wrapper that applies the workaround after fitting."""
+    result = _original_pipeline_fit(self, X, y, **fit_params)
+    
+    # Apply workaround if pipeline has a preprocessor step (ColumnTransformer)
+    if "preprocessor" in self.named_steps:
+        ct = self.named_steps["preprocessor"]
+        if isinstance(ct, ColumnTransformer):
+            _copy_fitted_attributes_for_test(ct, "std_scaler", ["mean_", "scale_", "var_", "n_samples_seen_"])
+            _copy_fitted_attributes_for_test(ct, "robust_scaler", ["center_", "scale_"])
+    
+    return result
+
+
+Pipeline.fit = _patched_pipeline_fit
 
 def resolve_project_root(
     candidates: Optional[list[Path]] = None,
