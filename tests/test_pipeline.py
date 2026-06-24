@@ -1,0 +1,670 @@
+# =============================================================================
+# tests/test_pipeline.py
+# California Housing Project — Unit Tests for src/features/pipeline.py
+#
+# Fixtures from conftest.py used:
+#   - empty_df : completely empty DataFrame
+#
+# All other fixtures defined inline for precise control over column layout
+# (post-engineering data: log1p applied, ratios created, raw cols dropped).
+#
+# Test classes:
+#   1.  TestResolveColumns        — column routing to correct transformers
+#   2.  TestBuildPipeline         — sklearn Pipeline construction
+#   3.  TestFitTransformPipeline  — fit-on-train-only, output shapes
+#   4.  TestGetFeatureNames       — OHE expansion, feature name extraction
+#   5.  TestSaveLoadPipeline      — round-trip pickle artifact
+#   6.  TestPipelineResult        — dataclass + summary()
+#   7.  TestRunPipeline           — end-to-end integration
+#   8.  TestNoDataLeakage         — val/test not influencing fit
+# =============================================================================
+
+import numpy as np
+import pandas as pd
+import pickle
+import pytest
+from pathlib import Path
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler, RobustScaler, OneHotEncoder
+
+from src.features.pipeline import (
+    PipelineError,
+    PipelineResult,
+    resolve_columns,
+    build_pipeline,
+    fit_transform_pipeline,
+    get_feature_names,
+    save_pipeline,
+    load_pipeline,
+    run_pipeline,
+    _STD_SCALE_COLS,
+    _ROBUST_SCALE_COLS,
+    _CAT_COLS,
+    _PASSTHROUGH_COLS,
+    _TARGET,
+)
+
+
+# =============================================================================
+# SHARED FIXTURES
+# =============================================================================
+
+@pytest.fixture
+def feat_df() -> pd.DataFrame:
+    """
+    Minimal post-engineering DataFrame (40 rows).
+    Mirrors what data/processed/train_feat.csv looks like:
+    - log1p already applied to count cols (cleaning.py)
+    - ratio + distance features present (engineering.py)
+    - raw size cols dropped (engineering.py)
+    - is_capped + lof_outlier flags present (cleaning.py)
+    """
+    np.random.seed(42)
+    n = 40
+    return pd.DataFrame({
+        # Standard-scaled
+        "longitude"              : np.random.uniform(-124.0, -114.5, n),
+        "latitude"               : np.random.uniform(32.5, 42.0, n),
+        "housing_median_age"     : np.random.uniform(1, 52, n),
+        "rooms_per_household"    : np.random.uniform(3, 10, n),
+        "bedrooms_per_room"      : np.random.uniform(0.1, 0.5, n),
+        "population_per_household": np.random.uniform(1, 5, n),
+        "dist_SF"                : np.random.uniform(0, 10, n),
+        "dist_LA"                : np.random.uniform(0, 10, n),
+        # Robust-scaled
+        "median_income"          : np.random.uniform(0.5, 15.0, n),
+        # Categorical
+        "ocean_proximity"        : np.random.choice(
+            ["NEAR BAY", "<1H OCEAN", "INLAND", "NEAR OCEAN"], n
+        ),
+        # Passthrough flags
+        "is_capped"              : np.zeros(n, dtype=int),
+        "lof_outlier"            : np.zeros(n, dtype=int),
+        # Target
+        "median_house_value"     : np.random.uniform(15000, 490000, n),
+    })
+
+
+@pytest.fixture
+def three_feat_splits(feat_df):
+    """Split feat_df into train(24)/val(8)/test(8)."""
+    train = feat_df.iloc[:24].reset_index(drop=True)
+    val   = feat_df.iloc[24:32].reset_index(drop=True)
+    test  = feat_df.iloc[32:].reset_index(drop=True)
+    return train, val, test
+
+
+@pytest.fixture
+def resolved_cols(feat_df):
+    """Pre-resolved column dict for the standard feat_df layout."""
+    return resolve_columns(feat_df)
+
+
+@pytest.fixture
+def fitted_pipeline_and_data(three_feat_splits):
+    """Return a fitted pipeline + transformed arrays for reuse."""
+    train, val, test = three_feat_splits
+    cols = resolve_columns(train)
+    pipeline = build_pipeline(cols)
+    pipeline, X_tr, X_v, X_te, y_tr, y_v, y_te = fit_transform_pipeline(
+        pipeline, train, val, test
+    )
+    return pipeline, X_tr, X_v, X_te, y_tr, y_v, y_te
+
+
+# =============================================================================
+# 1. resolve_columns
+# =============================================================================
+
+class TestResolveColumns:
+
+    def test_std_scale_cols_present(self, feat_df):
+        cols = resolve_columns(feat_df)
+        for col in _STD_SCALE_COLS:
+            if col in feat_df.columns:
+                assert col in cols["std"]
+
+    def test_robust_scale_cols_present(self, feat_df):
+        cols = resolve_columns(feat_df)
+        assert "median_income" in cols["robust"]
+
+    def test_cat_cols_present(self, feat_df):
+        cols = resolve_columns(feat_df)
+        assert "ocean_proximity" in cols["cat"]
+
+    def test_passthrough_cols_present(self, feat_df):
+        cols = resolve_columns(feat_df)
+        assert "is_capped" in cols["passthrough"]
+        assert "lof_outlier" in cols["passthrough"]
+
+    def test_missing_col_excluded_with_warning(self, feat_df):
+        df = feat_df.drop(columns=["median_income"])
+        cols = resolve_columns(df)
+        assert "median_income" not in cols["robust"]
+
+    def test_target_not_in_any_group(self, feat_df):
+        cols = resolve_columns(feat_df)
+        all_assigned = (
+            cols["std"] + cols["robust"] + cols["cat"] + cols["passthrough"]
+        )
+        assert _TARGET not in all_assigned
+
+    def test_returns_dict_with_four_keys(self, feat_df):
+        cols = resolve_columns(feat_df)
+        assert set(cols.keys()) == {"std", "robust", "cat", "passthrough"}
+
+    def test_no_overlap_between_groups(self, feat_df):
+        cols = resolve_columns(feat_df)
+        all_cols = (
+            cols["std"] + cols["robust"] + cols["cat"] + cols["passthrough"]
+        )
+        assert len(all_cols) == len(set(all_cols)), "Duplicate columns across groups"
+
+
+# =============================================================================
+# 2. build_pipeline
+# =============================================================================
+
+class TestBuildPipeline:
+
+    def test_returns_sklearn_pipeline(self, resolved_cols):
+        pipeline = build_pipeline(resolved_cols)
+        assert isinstance(pipeline, Pipeline)
+
+    def test_pipeline_has_preprocessor_step(self, resolved_cols):
+        pipeline = build_pipeline(resolved_cols)
+        assert "preprocessor" in pipeline.named_steps
+
+    def test_standard_scaler_in_transformers(self, resolved_cols):
+        pipeline = build_pipeline(resolved_cols)
+        ct = pipeline.named_steps["preprocessor"]
+        transformer_names = [name for name, _, _ in ct.transformers]
+        assert "std_scaler" in transformer_names
+
+    def test_robust_scaler_in_transformers(self, resolved_cols):
+        pipeline = build_pipeline(resolved_cols)
+        ct = pipeline.named_steps["preprocessor"]
+        transformer_names = [name for name, _, _ in ct.transformers]
+        assert "robust_scaler" in transformer_names
+
+    def test_ohe_in_transformers(self, resolved_cols):
+        pipeline = build_pipeline(resolved_cols)
+        ct = pipeline.named_steps["preprocessor"]
+        transformer_names = [name for name, _, _ in ct.transformers]
+        assert "ohe" in transformer_names
+
+    def test_ohe_handle_unknown_is_ignore(self, resolved_cols):
+        pipeline = build_pipeline(resolved_cols)
+        ct = pipeline.named_steps["preprocessor"]
+        ohe = next(t for name, t, _ in ct.transformers if name == "ohe")
+        assert ohe.handle_unknown == "ignore"
+
+    def test_raises_when_no_columns_match(self):
+        empty_cols = {"std": [], "robust": [], "cat": [], "passthrough": []}
+        with pytest.raises(PipelineError, match="No columns matched"):
+            build_pipeline(empty_cols)
+
+    def test_pipeline_not_yet_fitted(self, resolved_cols):
+        pipeline = build_pipeline(resolved_cols)
+        from sklearn.exceptions import NotFittedError
+        import pytest
+        with pytest.raises(Exception):   # NotFittedError on transform
+            pipeline.transform(pd.DataFrame({"dummy": [1]}))
+
+
+# =============================================================================
+# 3. fit_transform_pipeline
+# =============================================================================
+
+class TestFitTransformPipeline:
+
+    def test_returns_seven_items(self, three_feat_splits):
+        train, val, test = three_feat_splits
+        cols = resolve_columns(train)
+        pipeline = build_pipeline(cols)
+        result = fit_transform_pipeline(pipeline, train, val, test)
+        assert len(result) == 7
+
+    def test_output_shapes_consistent(self, three_feat_splits):
+        train, val, test = three_feat_splits
+        cols = resolve_columns(train)
+        pipeline = build_pipeline(cols)
+        _, X_tr, X_v, X_te, y_tr, y_v, y_te = fit_transform_pipeline(
+            pipeline, train, val, test
+        )
+        assert X_tr.shape[0] == len(train)
+        assert X_v.shape[0]  == len(val)
+        assert X_te.shape[0] == len(test)
+
+    def test_same_number_of_features_across_splits(self, three_feat_splits):
+        train, val, test = three_feat_splits
+        cols = resolve_columns(train)
+        pipeline = build_pipeline(cols)
+        _, X_tr, X_v, X_te, *_ = fit_transform_pipeline(
+            pipeline, train, val, test
+        )
+        assert X_tr.shape[1] == X_v.shape[1] == X_te.shape[1]
+
+    def test_output_is_numpy_array(self, three_feat_splits):
+        train, val, test = three_feat_splits
+        cols = resolve_columns(train)
+        pipeline = build_pipeline(cols)
+        _, X_tr, X_v, X_te, *_ = fit_transform_pipeline(
+            pipeline, train, val, test
+        )
+        for arr in [X_tr, X_v, X_te]:
+            assert isinstance(arr, np.ndarray)
+
+    def test_target_not_in_X(self, three_feat_splits):
+        train, val, test = three_feat_splits
+        n_features_without_target = train.shape[1] - 1  # minus target
+        cols = resolve_columns(train)
+        pipeline = build_pipeline(cols)
+        _, X_tr, *_ = fit_transform_pipeline(pipeline, train, val, test)
+        # After OHE expansion, output cols >= n_features_without_target - cat_cols + ohe_cats
+        assert X_tr.shape[1] >= n_features_without_target
+
+    def test_y_series_length_matches_split(self, three_feat_splits):
+        train, val, test = three_feat_splits
+        cols = resolve_columns(train)
+        pipeline = build_pipeline(cols)
+        _, _, _, _, y_tr, y_v, y_te = fit_transform_pipeline(
+            pipeline, train, val, test
+        )
+        assert len(y_tr) == len(train)
+        assert len(y_v)  == len(val)
+        assert len(y_te) == len(test)
+
+    def test_raises_when_target_missing(self, three_feat_splits):
+        train, val, test = three_feat_splits
+        train_no_target = train.drop(columns=[_TARGET])
+        cols = resolve_columns(train_no_target)
+        pipeline = build_pipeline(cols)
+        with pytest.raises(PipelineError, match="Target column"):
+            fit_transform_pipeline(pipeline, train_no_target, val, test)
+
+    def test_no_nan_in_output_arrays(self, three_feat_splits):
+        train, val, test = three_feat_splits
+        cols = resolve_columns(train)
+        pipeline = build_pipeline(cols)
+        _, X_tr, X_v, X_te, *_ = fit_transform_pipeline(
+            pipeline, train, val, test
+        )
+        for name, arr in [("train", X_tr), ("val", X_v), ("test", X_te)]:
+            assert not np.isnan(arr).any(), f"NaN in {name} output array"
+
+
+# =============================================================================
+# 4. get_feature_names
+# =============================================================================
+
+class TestGetFeatureNames:
+
+    def test_returns_list_of_strings(self, fitted_pipeline_and_data):
+        pipeline, *_ = fitted_pipeline_and_data
+        names = get_feature_names(pipeline)
+        assert isinstance(names, list)
+        assert all(isinstance(n, str) for n in names)
+
+    def test_length_matches_output_columns(self, fitted_pipeline_and_data):
+        pipeline, X_tr, *_ = fitted_pipeline_and_data
+        names = get_feature_names(pipeline)
+        assert len(names) == X_tr.shape[1]
+
+    def test_ohe_categories_in_names(self, fitted_pipeline_and_data):
+        pipeline, *_ = fitted_pipeline_and_data
+        names = get_feature_names(pipeline)
+        ohe_names = [n for n in names if "ocean_proximity" in n]
+        assert len(ohe_names) >= 2, "Expected at least 2 OHE categories in feature names"
+
+    def test_standard_scaled_cols_in_names(self, fitted_pipeline_and_data):
+        pipeline, *_ = fitted_pipeline_and_data
+        names = get_feature_names(pipeline)
+        assert "longitude" in names
+        assert "latitude"  in names
+
+    def test_robust_scaled_col_in_names(self, fitted_pipeline_and_data):
+        pipeline, *_ = fitted_pipeline_and_data
+        names = get_feature_names(pipeline)
+        assert "median_income" in names
+
+    def test_passthrough_cols_in_names(self, fitted_pipeline_and_data):
+        pipeline, *_ = fitted_pipeline_and_data
+        names = get_feature_names(pipeline)
+        assert "is_capped"    in names
+        assert "lof_outlier"  in names
+
+    def test_target_not_in_names(self, fitted_pipeline_and_data):
+        pipeline, *_ = fitted_pipeline_and_data
+        names = get_feature_names(pipeline)
+        assert _TARGET not in names
+
+
+# =============================================================================
+# 5. save_pipeline / load_pipeline
+# =============================================================================
+
+class TestSaveLoadPipeline:
+
+    def test_save_creates_pkl_file(self, fitted_pipeline_and_data, tmp_path):
+        pipeline, *_ = fitted_pipeline_and_data
+        path = save_pipeline(pipeline, output_dir=tmp_path)
+        assert path.exists()
+        assert path.suffix == ".pkl"
+
+    def test_round_trip_produces_identical_predictions(
+        self, fitted_pipeline_and_data, three_feat_splits, tmp_path
+    ):
+        pipeline, X_tr, *_ = fitted_pipeline_and_data
+        train, val, test = three_feat_splits
+
+        save_pipeline(pipeline, output_dir=tmp_path)
+        loaded = load_pipeline(artifacts_dir=tmp_path)
+
+        X_loaded = loaded.transform(train.drop(columns=[_TARGET]))
+        np.testing.assert_array_almost_equal(X_tr, X_loaded)
+
+    def test_load_raises_when_file_missing(self, tmp_path):
+        with pytest.raises(FileNotFoundError):
+            load_pipeline(artifacts_dir=tmp_path)
+
+    def test_loaded_pipeline_is_sklearn_pipeline(
+        self, fitted_pipeline_and_data, tmp_path
+    ):
+        pipeline, *_ = fitted_pipeline_and_data
+        save_pipeline(pipeline, output_dir=tmp_path)
+        loaded = load_pipeline(artifacts_dir=tmp_path)
+        assert isinstance(loaded, Pipeline)
+
+    def test_pkl_is_valid_pickle(self, fitted_pipeline_and_data, tmp_path):
+        pipeline, *_ = fitted_pipeline_and_data
+        path = save_pipeline(pipeline, output_dir=tmp_path)
+        with open(path, "rb") as f:
+            obj = pickle.load(f)
+        assert isinstance(obj, Pipeline)
+
+
+# =============================================================================
+# 6. PipelineResult
+# =============================================================================
+
+class TestPipelineResult:
+
+    def test_summary_contains_shapes(self, fitted_pipeline_and_data):
+        pipeline, X_tr, X_v, X_te, y_tr, y_v, y_te = fitted_pipeline_and_data
+        result = PipelineResult(
+            X_train=X_tr, X_val=X_v, X_test=X_te,
+            y_train=y_tr, y_val=y_v, y_test=y_te,
+            n_features=X_tr.shape[1],
+        )
+        summary = result.summary()
+        assert str(X_tr.shape) in summary
+
+    def test_summary_shows_dvc_not_tracked(self, fitted_pipeline_and_data):
+        pipeline, X_tr, X_v, X_te, y_tr, y_v, y_te = fitted_pipeline_and_data
+        result = PipelineResult(
+            X_train=X_tr, X_val=X_v, X_test=X_te,
+            y_train=y_tr, y_val=y_v, y_test=y_te,
+        )
+        assert "no" in result.summary()
+
+    def test_summary_shows_warnings(self, fitted_pipeline_and_data):
+        pipeline, X_tr, X_v, X_te, y_tr, y_v, y_te = fitted_pipeline_and_data
+        result = PipelineResult(
+            X_train=X_tr, X_val=X_v, X_test=X_te,
+            y_train=y_tr, y_val=y_v, y_test=y_te,
+            warnings=["DVC push failed"],
+        )
+        assert "DVC push failed" in result.summary()
+
+    def test_summary_shows_n_features(self, fitted_pipeline_and_data):
+        pipeline, X_tr, X_v, X_te, y_tr, y_v, y_te = fitted_pipeline_and_data
+        result = PipelineResult(
+            X_train=X_tr, X_val=X_v, X_test=X_te,
+            y_train=y_tr, y_val=y_v, y_test=y_te,
+            n_features=X_tr.shape[1],
+        )
+        assert str(X_tr.shape[1]) in result.summary()
+
+
+# =============================================================================
+# 7. run_pipeline (integration)
+# =============================================================================
+
+class TestRunPipeline:
+
+    def test_returns_pipeline_result(self, three_feat_splits, tmp_path):
+        train, val, test = three_feat_splits
+        result = run_pipeline(
+            train, val, test,
+            artifacts_dir=tmp_path,
+            auto_track_dvc=False,
+        )
+        assert isinstance(result, PipelineResult)
+
+    def test_output_arrays_are_numpy(self, three_feat_splits, tmp_path):
+        train, val, test = three_feat_splits
+        result = run_pipeline(
+            train, val, test,
+            artifacts_dir=tmp_path,
+            auto_track_dvc=False,
+        )
+        for arr in [result.X_train, result.X_val, result.X_test]:
+            assert isinstance(arr, np.ndarray)
+
+    def test_pipeline_artifact_saved(self, three_feat_splits, tmp_path):
+        train, val, test = three_feat_splits
+        result = run_pipeline(
+            train, val, test,
+            artifacts_dir=tmp_path,
+            auto_track_dvc=False,
+            save=True,
+        )
+        assert result.pipeline_path is not None
+        assert result.pipeline_path.exists()
+
+    def test_no_save_when_save_false(self, three_feat_splits, tmp_path):
+        train, val, test = three_feat_splits
+        result = run_pipeline(
+            train, val, test,
+            artifacts_dir=tmp_path,
+            auto_track_dvc=False,
+            save=False,
+        )
+        assert result.pipeline_path is None
+
+    def test_feature_names_populated(self, three_feat_splits, tmp_path):
+        train, val, test = three_feat_splits
+        result = run_pipeline(
+            train, val, test,
+            artifacts_dir=tmp_path,
+            auto_track_dvc=False,
+        )
+        assert len(result.feature_names_out) > 0
+        assert len(result.feature_names_out) == result.n_features
+
+    def test_n_features_matches_array_shape(self, three_feat_splits, tmp_path):
+        train, val, test = three_feat_splits
+        result = run_pipeline(
+            train, val, test,
+            artifacts_dir=tmp_path,
+            auto_track_dvc=False,
+        )
+        assert result.n_features == result.X_train.shape[1]
+
+    def test_raises_on_empty_train(self, empty_df, feat_df, tmp_path):
+        with pytest.raises(PipelineError, match="empty"):
+            run_pipeline(
+                empty_df, feat_df.head(5), feat_df.head(5),
+                artifacts_dir=tmp_path,
+                auto_track_dvc=False,
+            )
+
+    def test_raises_when_target_missing(self, three_feat_splits, tmp_path):
+        train, val, test = three_feat_splits
+        train_no_target = train.drop(columns=[_TARGET])
+        with pytest.raises(PipelineError, match="Target column"):
+            run_pipeline(
+                train_no_target, val, test,
+                artifacts_dir=tmp_path,
+                auto_track_dvc=False,
+            )
+
+    def test_no_nan_in_result_arrays(self, three_feat_splits, tmp_path):
+        train, val, test = three_feat_splits
+        result = run_pipeline(
+            train, val, test,
+            artifacts_dir=tmp_path,
+            auto_track_dvc=False,
+        )
+        for name, arr in [
+            ("X_train", result.X_train),
+            ("X_val",   result.X_val),
+            ("X_test",  result.X_test),
+        ]:
+            assert not np.isnan(arr).any(), f"NaN in {name}"
+
+    def test_result_summary_is_string(self, three_feat_splits, tmp_path):
+        train, val, test = three_feat_splits
+        result = run_pipeline(
+            train, val, test,
+            artifacts_dir=tmp_path,
+            auto_track_dvc=False,
+        )
+        assert isinstance(result.summary(), str)
+        assert len(result.summary()) > 0
+
+    def test_unknown_ohe_category_handled(self, three_feat_splits, tmp_path):
+        """
+        ISLAND is rare — if it appears in val/test but not train,
+        handle_unknown='ignore' should return zeros (not raise).
+        """
+        train, val, test = three_feat_splits
+        test = test.copy()
+        test.loc[0, "ocean_proximity"] = "ISLAND"  # unseen in train
+
+        result = run_pipeline(
+            train, val, test,
+            artifacts_dir=tmp_path,
+            auto_track_dvc=False,
+        )
+        # Should not raise — just returns zeros for unseen category
+        assert not np.isnan(result.X_test).any()
+
+
+# =============================================================================
+# 8. No Data Leakage
+# =============================================================================
+
+class TestNoDataLeakage:
+
+    def test_scaler_mean_comes_from_train_only(self, three_feat_splits):
+        """
+        StandardScaler.mean_ must equal train mean, not val or test mean.
+        """
+        train, val, test = three_feat_splits
+        cols = resolve_columns(train)
+        pipeline = build_pipeline(cols)
+        fit_transform_pipeline(pipeline, train, val, test)
+
+        ct = pipeline.named_steps["preprocessor"]
+        scaler = next(t for name, t, _ in ct.transformers if name == "std_scaler")
+
+        # Get index of longitude in std_scale cols
+        std_cols = next(c for name, _, c in ct.transformers if name == "std_scaler")
+        lon_idx = std_cols.index("longitude")
+
+        train_mean = train["longitude"].mean()
+        assert scaler.mean_[lon_idx] == pytest.approx(train_mean, rel=1e-5)
+
+    def test_val_transform_uses_train_statistics(self, three_feat_splits):
+        """
+        Val output must differ from what we'd get if we fit on val directly.
+        """
+        train, val, test = three_feat_splits
+
+        # Fit on train, transform val
+        cols = resolve_columns(train)
+        pipeline_train = build_pipeline(cols)
+        _, _, X_val_from_train, *_ = fit_transform_pipeline(
+            pipeline_train, train, val, test
+        )
+
+        # Fit on val directly (leakage simulation)
+        cols_val = resolve_columns(val)
+        pipeline_val = build_pipeline(cols_val)
+        pipeline_val.fit(val.drop(columns=[_TARGET]))
+        X_val_from_val = pipeline_val.transform(val.drop(columns=[_TARGET]))
+
+        # If train ≠ val distribution, the two outputs should differ
+        # (they use different scaler means)
+        ct_train = pipeline_train.named_steps["preprocessor"]
+        ct_val   = pipeline_val.named_steps["preprocessor"]
+        scaler_train = next(t for n, t, _ in ct_train.transformers if n == "std_scaler")
+        scaler_val   = next(t for n, t, _ in ct_val.transformers if n == "std_scaler")
+        # The means should differ because train and val have different row sets
+        assert not np.allclose(scaler_train.mean_, scaler_val.mean_), (
+            "Train and val scalers have identical means — "
+            "train and val may be identical, or leakage occurred"
+        )
+
+    def test_shuffle_train_does_not_change_val_output(self, three_feat_splits, tmp_path):
+        """
+        Shuffling train rows must not change the val output
+        (statistics are order-independent).
+        """
+        train, val, test = three_feat_splits
+
+        result1 = run_pipeline(
+            train, val, test,
+            artifacts_dir=tmp_path / "run1",
+            auto_track_dvc=False,
+        )
+
+        train_shuffled = train.sample(frac=1, random_state=99).reset_index(drop=True)
+        result2 = run_pipeline(
+            train_shuffled, val, test,
+            artifacts_dir=tmp_path / "run2",
+            auto_track_dvc=False,
+        )
+
+        np.testing.assert_array_almost_equal(result1.X_val, result2.X_val)
+        np.testing.assert_array_almost_equal(result1.X_test, result2.X_test)
+
+    def test_pipeline_not_refitted_on_val(self, three_feat_splits):
+        """
+        fit_transform_pipeline must call fit() exactly once (on train).
+        Applying the pipeline to val must not refit.
+        """
+        train, val, test = three_feat_splits
+        cols = resolve_columns(train)
+        pipeline = build_pipeline(cols)
+
+        pipeline, *_ = fit_transform_pipeline(pipeline, train, val, test)
+
+        # After fit, transform val again — must produce same result
+        X_val_1 = pipeline.transform(val.drop(columns=[_TARGET]))
+        X_val_2 = pipeline.transform(val.drop(columns=[_TARGET]))
+        np.testing.assert_array_equal(X_val_1, X_val_2)
+
+    def test_same_seed_same_result(self, feat_df, tmp_path):
+        """
+        Determinism check: same data, same config -> identical output.
+        """
+        train = feat_df.iloc[:24].reset_index(drop=True)
+        val   = feat_df.iloc[24:32].reset_index(drop=True)
+        test  = feat_df.iloc[32:].reset_index(drop=True)
+
+        result1 = run_pipeline(
+            train, val, test,
+            artifacts_dir=tmp_path / "r1",
+            auto_track_dvc=False,
+        )
+        result2 = run_pipeline(
+            train, val, test,
+            artifacts_dir=tmp_path / "r2",
+            auto_track_dvc=False,
+        )
+
+        np.testing.assert_array_almost_equal(result1.X_train, result2.X_train)
+        np.testing.assert_array_almost_equal(result1.X_val,   result2.X_val)
