@@ -29,7 +29,6 @@ import yaml
 import pandas as pd
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import Optional
 
 from src.data.data_loader import DataLoader
 from src.utils.logger import get_logger

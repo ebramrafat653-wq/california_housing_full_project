@@ -9,7 +9,6 @@ environment-aware behavior across raw/interim/processed stages.
 
 from pathlib import Path
 
-import pandas as pd
 import pytest
 
 from src.data.data_loader import DataLoader, DataStage

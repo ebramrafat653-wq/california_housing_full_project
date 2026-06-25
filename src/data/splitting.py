@@ -31,13 +31,11 @@ from pathlib import Path
 from typing import Optional
 
 import pandas as pd
-import numpy as np
 import yaml
 from sklearn.model_selection import train_test_split
 
 from src.utils.logger import get_logger
 from src.utils.paths import (
-    PATHS,
     PROJECT_DIR,
     DVC_REMOTE_NAME,
     is_dvc_initialized,

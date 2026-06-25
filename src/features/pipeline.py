@@ -58,7 +58,6 @@ from src.utils.paths import (
     PROJECT_DIR,
     DVC_REMOTE_NAME,
     is_dvc_initialized,
-    ensure_path,
     configure_git_identity,
 )
 

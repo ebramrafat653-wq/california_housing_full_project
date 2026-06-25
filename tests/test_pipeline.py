@@ -23,9 +23,7 @@ import numpy as np
 import pandas as pd
 import pickle
 import pytest
-from pathlib import Path
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler, RobustScaler, OneHotEncoder
 
 from src.features.pipeline import (
     PipelineError,
@@ -38,9 +36,6 @@ from src.features.pipeline import (
     load_pipeline,
     run_pipeline,
     _STD_SCALE_COLS,
-    _ROBUST_SCALE_COLS,
-    _CAT_COLS,
-    _PASSTHROUGH_COLS,
     _TARGET,
 )
 
@@ -206,7 +201,6 @@ class TestBuildPipeline:
 
     def test_pipeline_not_yet_fitted(self, resolved_cols):
         pipeline = build_pipeline(resolved_cols)
-        from sklearn.exceptions import NotFittedError
         import pytest
         with pytest.raises(Exception):   # NotFittedError on transform
             pipeline.transform(pd.DataFrame({"dummy": [1]}))
@@ -594,7 +588,7 @@ class TestNoDataLeakage:
         cols_val = resolve_columns(val)
         pipeline_val = build_pipeline(cols_val)
         pipeline_val.fit(val.drop(columns=[_TARGET]))
-        X_val_from_val = pipeline_val.transform(val.drop(columns=[_TARGET]))
+        pipeline_val.transform(val.drop(columns=[_TARGET]))
 
         # If train ≠ val distribution, the two outputs should differ
         # (they use different scaler means)

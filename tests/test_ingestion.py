@@ -19,7 +19,7 @@ Compatible with ingestion.py API:
 
 import subprocess
 from pathlib import Path
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch
 from datetime import datetime
 
 import pytest
@@ -335,8 +335,10 @@ class TestDownloadFromKaggle:
         assert "datasets"  in call_args
         assert "download"  in call_args
         assert "test/data" in call_args
-        if unzip:  assert "--unzip" in call_args
-        if force:  assert "--force" in call_args
+        if unzip:
+            assert "--unzip" in call_args
+        if force:
+            assert "--force" in call_args
         assert report.source == "kaggle"
 
     def test_download_failure_returns_error_report(self, tmp_path: Path) -> None:

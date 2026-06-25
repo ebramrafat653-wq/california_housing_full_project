@@ -54,7 +54,6 @@ from sklearn.neighbors import LocalOutlierFactor
 
 from src.utils.logger import get_logger
 from src.utils.paths import (
-    PATHS,
     PROJECT_DIR,
     DVC_REMOTE_NAME,
     is_dvc_initialized,
