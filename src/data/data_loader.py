@@ -6,6 +6,7 @@ Data loading module for California Housing project.
 Provides a unified interface for loading CSV datasets from configured
 storage paths (raw, interim, processed) with environment-aware resolution.
 """
+from __future__ import annotations
 
 from pathlib import Path
 from typing import Literal
