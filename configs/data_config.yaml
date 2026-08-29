@@ -101,15 +101,16 @@ eda_derived:
   # Welch t-test (numeric) + chi-square (categorical) against total_bedrooms.isnull()
   missingness:
     total_bedrooms:
+      impute: true                     
+      imputation_strategy: "median"    
       missing_pct: 0.969
       chi2_pvalue_vs_ocean_proximity: 0.3095
-      mechanism: "MCAR"              # p >= 0.05 -> not related to ocean_proximity
-      imputation_strategy: "global_median"   # MCAR -> simple global median is valid
+      mechanism: "MCAR"  
 
   # --- Target distribution (Section 4) -----------------------------------------
   target_summary:
     skewness_raw: 0.982
-    skewness_log1p: null             # not computed in this run — log1p still recommended
+    skewness_log1p: null             
     pct_capped: 4.727
     n_capped: 683
     cap_threshold: 500001.0
@@ -168,7 +169,7 @@ eda_derived:
       - "latitude"
     n_outliers_detected: 289
     pct_outliers: 2.00
-    novelty: true                    # allows .predict() on val/test without refitting
+    novelty: true                   
 
   # --- Feature transformation decisions (-> cleaning.py) ---------------------------
   log1p_columns:
@@ -177,7 +178,7 @@ eda_derived:
     - "population"
     - "households"
   no_transform_columns:
-    - "median_income"               # not a count variable; use RobustScaler for linear models
+    - "median_income"               
 
   # --- Feature engineering candidates (-> feature_engineering.py) ------------------
   engineered_features:
@@ -202,7 +203,7 @@ split:
   test_size: 0.15
   random_state: 42
   shuffle: true
-  strategy: "stratified"             # stratified on quantile-binned target
+  strategy: "stratified"             
   n_strata_bins: 5
 
 # -----------------------------------------------------------------------------
@@ -226,4 +227,24 @@ dvc:
       - "data/raw"
   cache:
     type: "symlink"
-    protected: true
+    protected: 
+
+# -----------------------------------------------------------------------------
+# FEATURES CONFIGURATION (for preprocessing.py)
+# -----------------------------------------------------------------------------
+features_config:
+  numerical_standard_scaler:
+    - "longitude"
+    - "latitude"
+    - "housing_median_age"
+    - "rooms_per_household"
+    - "bedrooms_per_room"
+    - "population_per_household"
+    - "dist_SF"
+    - "dist_LA"
+  numerical_robust_scaler:
+    - "median_income"
+  categorical_one_hot:
+    - "ocean_proximity"
+  passthrough:
+    - "lof_outlier"
