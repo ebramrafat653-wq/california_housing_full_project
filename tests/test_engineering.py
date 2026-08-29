@@ -385,12 +385,6 @@ class TestEngineeringResult:
         )
         assert "WARNING" in result.summary() or "fallback" in result.summary()
 
-    def test_summary_shows_dvc_not_tracked(self, clean_df):
-        result = EngineeringResult(
-            train=clean_df, val=clean_df, test=clean_df
-        )
-        assert "no" in result.summary()
-
     def test_summary_shows_warnings(self, clean_df):
         result = EngineeringResult(
             train=clean_df, val=clean_df, test=clean_df,
@@ -411,7 +405,6 @@ class TestRunFeatureEngineering:
             train, val, test,
             config_path=feat_config_yaml,
             output_dir=tmp_path / "processed",
-            auto_track_dvc=False,
         )
         assert isinstance(result, EngineeringResult)
 
@@ -422,7 +415,6 @@ class TestRunFeatureEngineering:
             train, val, test,
             config_path=feat_config_yaml,
             output_dir=out,
-            auto_track_dvc=False,
         )
         assert (out / "train_feat.csv").exists()
         assert (out / "val_feat.csv").exists()
@@ -434,7 +426,6 @@ class TestRunFeatureEngineering:
             train, val, test,
             config_path=feat_config_yaml,
             output_dir=tmp_path / "processed",
-            auto_track_dvc=False,
         )
         for ratio_name in ["rooms_per_household", "bedrooms_per_room", "population_per_household"]:
             for name, df in [("train", result.train), ("val", result.val), ("test", result.test)]:
@@ -446,7 +437,6 @@ class TestRunFeatureEngineering:
             train, val, test,
             config_path=feat_config_yaml,
             output_dir=tmp_path / "processed",
-            auto_track_dvc=False,
         )
         for dist_name in ["dist_SF", "dist_LA"]:
             for name, df in [("train", result.train), ("val", result.val), ("test", result.test)]:
@@ -458,7 +448,6 @@ class TestRunFeatureEngineering:
             train, val, test,
             config_path=feat_config_yaml,
             output_dir=tmp_path / "processed",
-            auto_track_dvc=False,
         )
         for col in ["total_rooms", "total_bedrooms", "population", "households"]:
             for name, df in [("train", result.train), ("val", result.val), ("test", result.test)]:
@@ -469,7 +458,6 @@ class TestRunFeatureEngineering:
             run_feature_engineering(
                 empty_df, clean_df.head(5), clean_df.head(5),
                 output_dir=tmp_path,
-                auto_track_dvc=False,
             )
 
     def test_result_summary_is_string(self, three_clean_splits, feat_config_yaml, tmp_path):
@@ -478,7 +466,6 @@ class TestRunFeatureEngineering:
             train, val, test,
             config_path=feat_config_yaml,
             output_dir=tmp_path / "processed",
-            auto_track_dvc=False,
         )
         assert isinstance(result.summary(), str)
         assert len(result.summary()) > 0
@@ -489,7 +476,6 @@ class TestRunFeatureEngineering:
             train, val, test,
             config_path=feat_config_yaml,
             output_dir=tmp_path / "processed",
-            auto_track_dvc=False,
         )
         assert result.feature_config_source == "config"
 
@@ -499,7 +485,6 @@ class TestRunFeatureEngineering:
             train, val, test,
             config_path=tmp_path / "nonexistent.yaml",
             output_dir=tmp_path / "processed",
-            auto_track_dvc=False,
         )
         assert result.feature_config_source == "fallback"
 
@@ -509,7 +494,6 @@ class TestRunFeatureEngineering:
             train, val, test,
             config_path=feat_config_yaml,
             output_dir=tmp_path / "processed",
-            auto_track_dvc=False,
         )
         train_cols = list(result.train.columns)
         assert list(result.val.columns)  == train_cols
@@ -521,7 +505,6 @@ class TestRunFeatureEngineering:
             train, val, test,
             config_path=feat_config_yaml,
             output_dir=tmp_path / "processed",
-            auto_track_dvc=False,
         )
         new_cols = ["rooms_per_household", "bedrooms_per_room",
                     "population_per_household", "dist_SF", "dist_LA"]
@@ -583,7 +566,6 @@ class TestNoDataLeakage:
             train, val, test,
             config_path=feat_config_yaml,
             output_dir=tmp_path / "run1",
-            auto_track_dvc=False,
         )
 
         # Shuffle train rows — should produce identical val and test output
@@ -592,7 +574,6 @@ class TestNoDataLeakage:
             train_shuffled, val, test,
             config_path=feat_config_yaml,
             output_dir=tmp_path / "run2",
-            auto_track_dvc=False,
         )
 
         # Val and test must be identical regardless of train row order
