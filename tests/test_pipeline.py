@@ -132,10 +132,11 @@ class TestResolveColumns:
         assert "is_capped" in cols["passthrough"]
         assert "lof_outlier" in cols["passthrough"]
 
-    def test_missing_col_excluded_with_warning(self, feat_df):
+    def test_missing_col_raises_error(self, feat_df):
+        """resolve_columns must raise PipelineError when columns are missing."""
         df = feat_df.drop(columns=["median_income"])
-        cols = resolve_columns(df)
-        assert "median_income" not in cols["robust"]
+        with pytest.raises(PipelineError, match="Missing columns for 'robust'"):
+            resolve_columns(df)
 
     def test_target_not_in_any_group(self, feat_df):
         cols = resolve_columns(feat_df)
@@ -174,7 +175,7 @@ class TestBuildPipeline:
         pipeline = build_pipeline(resolved_cols)
         ct = pipeline.named_steps["preprocessor"]
         transformer_names = [name for name, _, _ in ct.transformers]
-        assert "std_scaler" in transformer_names
+        assert "standard_scaler" in transformer_names
 
     def test_robust_scaler_in_transformers(self, resolved_cols):
         pipeline = build_pipeline(resolved_cols)
@@ -182,21 +183,21 @@ class TestBuildPipeline:
         transformer_names = [name for name, _, _ in ct.transformers]
         assert "robust_scaler" in transformer_names
 
-    def test_ohe_in_transformers(self, resolved_cols):
+    def test_one_hot_encoder_in_transformers(self, resolved_cols):
         pipeline = build_pipeline(resolved_cols)
         ct = pipeline.named_steps["preprocessor"]
         transformer_names = [name for name, _, _ in ct.transformers]
-        assert "ohe" in transformer_names
+        assert "one_hot_encoder" in transformer_names
 
     def test_ohe_handle_unknown_is_ignore(self, resolved_cols):
         pipeline = build_pipeline(resolved_cols)
         ct = pipeline.named_steps["preprocessor"]
-        ohe = next(t for name, t, _ in ct.transformers if name == "ohe")
+        ohe = next(t for name, t, _ in ct.transformers if name == "one_hot_encoder")
         assert ohe.handle_unknown == "ignore"
 
     def test_raises_when_no_columns_match(self):
         empty_cols = {"std": [], "robust": [], "cat": [], "passthrough": []}
-        with pytest.raises(PipelineError, match="No columns matched"):
+        with pytest.raises(PipelineError, match="No preprocessing transformers were created"):
             build_pipeline(empty_cols)
 
     def test_pipeline_not_yet_fitted(self, resolved_cols):
@@ -274,7 +275,7 @@ class TestFitTransformPipeline:
         train_no_target = train.drop(columns=[_TARGET])
         cols = resolve_columns(train_no_target)
         pipeline = build_pipeline(cols)
-        with pytest.raises(PipelineError, match="Target column"):
+        with pytest.raises(PipelineError, match="Target 'median_house_value' is missing from train"):
             fit_transform_pipeline(pipeline, train_no_target, val, test)
 
     def test_no_nan_in_output_arrays(self, three_feat_splits):
@@ -394,14 +395,6 @@ class TestPipelineResult:
         summary = result.summary()
         assert str(X_tr.shape) in summary
 
-    def test_summary_shows_dvc_not_tracked(self, fitted_pipeline_and_data):
-        pipeline, X_tr, X_v, X_te, y_tr, y_v, y_te = fitted_pipeline_and_data
-        result = PipelineResult(
-            X_train=X_tr, X_val=X_v, X_test=X_te,
-            y_train=y_tr, y_val=y_v, y_test=y_te,
-        )
-        assert "no" in result.summary()
-
     def test_summary_shows_warnings(self, fitted_pipeline_and_data):
         pipeline, X_tr, X_v, X_te, y_tr, y_v, y_te = fitted_pipeline_and_data
         result = PipelineResult(
@@ -427,89 +420,89 @@ class TestPipelineResult:
 
 class TestRunPipeline:
 
+    @pytest.mark.integration
     def test_returns_pipeline_result(self, three_feat_splits, tmp_path):
         train, val, test = three_feat_splits
         result = run_pipeline(
             train, val, test,
             artifacts_dir=tmp_path,
-            auto_track_dvc=False,
         )
         assert isinstance(result, PipelineResult)
 
+    @pytest.mark.integration
     def test_output_arrays_are_numpy(self, three_feat_splits, tmp_path):
         train, val, test = three_feat_splits
         result = run_pipeline(
             train, val, test,
             artifacts_dir=tmp_path,
-            auto_track_dvc=False,
         )
         for arr in [result.X_train, result.X_val, result.X_test]:
             assert isinstance(arr, np.ndarray)
 
+    @pytest.mark.integration
     def test_pipeline_artifact_saved(self, three_feat_splits, tmp_path):
         train, val, test = three_feat_splits
         result = run_pipeline(
             train, val, test,
             artifacts_dir=tmp_path,
-            auto_track_dvc=False,
             save=True,
         )
         assert result.pipeline_path is not None
         assert result.pipeline_path.exists()
 
+    @pytest.mark.integration
     def test_no_save_when_save_false(self, three_feat_splits, tmp_path):
         train, val, test = three_feat_splits
         result = run_pipeline(
             train, val, test,
             artifacts_dir=tmp_path,
-            auto_track_dvc=False,
             save=False,
         )
         assert result.pipeline_path is None
 
+    @pytest.mark.integration
     def test_feature_names_populated(self, three_feat_splits, tmp_path):
         train, val, test = three_feat_splits
         result = run_pipeline(
             train, val, test,
             artifacts_dir=tmp_path,
-            auto_track_dvc=False,
         )
         assert len(result.feature_names_out) > 0
         assert len(result.feature_names_out) == result.n_features
 
+    @pytest.mark.integration
     def test_n_features_matches_array_shape(self, three_feat_splits, tmp_path):
         train, val, test = three_feat_splits
         result = run_pipeline(
             train, val, test,
             artifacts_dir=tmp_path,
-            auto_track_dvc=False,
         )
         assert result.n_features == result.X_train.shape[1]
 
+    @pytest.mark.integration
     def test_raises_on_empty_train(self, empty_df, feat_df, tmp_path):
         with pytest.raises(PipelineError, match="empty"):
             run_pipeline(
                 empty_df, feat_df.head(5), feat_df.head(5),
                 artifacts_dir=tmp_path,
-                auto_track_dvc=False,
             )
 
+    @pytest.mark.integration
     def test_raises_when_target_missing(self, three_feat_splits, tmp_path):
         train, val, test = three_feat_splits
         train_no_target = train.drop(columns=[_TARGET])
-        with pytest.raises(PipelineError, match="Target column"):
+        with pytest.raises(PipelineError, match="Target 'median_house_value' is missing from train"):
             run_pipeline(
                 train_no_target, val, test,
                 artifacts_dir=tmp_path,
-                auto_track_dvc=False,
             )
 
+    @pytest.mark.integration
     def test_no_nan_in_result_arrays(self, three_feat_splits, tmp_path):
         train, val, test = three_feat_splits
         result = run_pipeline(
             train, val, test,
             artifacts_dir=tmp_path,
-            auto_track_dvc=False,
         )
         for name, arr in [
             ("X_train", result.X_train),
@@ -518,16 +511,17 @@ class TestRunPipeline:
         ]:
             assert not np.isnan(arr).any(), f"NaN in {name}"
 
+    @pytest.mark.integration
     def test_result_summary_is_string(self, three_feat_splits, tmp_path):
         train, val, test = three_feat_splits
         result = run_pipeline(
             train, val, test,
             artifacts_dir=tmp_path,
-            auto_track_dvc=False,
         )
         assert isinstance(result.summary(), str)
         assert len(result.summary()) > 0
 
+    @pytest.mark.integration
     def test_unknown_ohe_category_handled(self, three_feat_splits, tmp_path):
         """
         ISLAND is rare — if it appears in val/test but not train,
@@ -540,7 +534,6 @@ class TestRunPipeline:
         result = run_pipeline(
             train, val, test,
             artifacts_dir=tmp_path,
-            auto_track_dvc=False,
         )
         # Should not raise — just returns zeros for unseen category
         assert not np.isnan(result.X_test).any()
@@ -562,10 +555,11 @@ class TestNoDataLeakage:
         fit_transform_pipeline(pipeline, train, val, test)
 
         ct = pipeline.named_steps["preprocessor"]
-        scaler = next(t for name, t, _ in ct.transformers if name == "std_scaler")
+        # استخدم named_transformers_ للحصول على النسخة الملائمة
+        scaler = ct.named_transformers_["standard_scaler"]
 
-        # Get index of longitude in std_scale cols
-        std_cols = next(c for name, _, c in ct.transformers if name == "std_scaler")
+        # احصل على مؤشر longitude من قائمة الأعمدة الأصلية
+        std_cols = cols["std"]
         lon_idx = std_cols.index("longitude")
 
         train_mean = train["longitude"].mean()
@@ -590,18 +584,19 @@ class TestNoDataLeakage:
         pipeline_val.fit(val.drop(columns=[_TARGET]))
         pipeline_val.transform(val.drop(columns=[_TARGET]))
 
-        # If train ≠ val distribution, the two outputs should differ
-        # (they use different scaler means)
         ct_train = pipeline_train.named_steps["preprocessor"]
         ct_val   = pipeline_val.named_steps["preprocessor"]
-        scaler_train = next(t for n, t, _ in ct_train.transformers if n == "std_scaler")
-        scaler_val   = next(t for n, t, _ in ct_val.transformers if n == "std_scaler")
+        # استخدم named_transformers_ للحصول على النسخ الملائمة
+        scaler_train = ct_train.named_transformers_["standard_scaler"]
+        scaler_val   = ct_val.named_transformers_["standard_scaler"]
+
         # The means should differ because train and val have different row sets
         assert not np.allclose(scaler_train.mean_, scaler_val.mean_), (
             "Train and val scalers have identical means — "
             "train and val may be identical, or leakage occurred"
         )
 
+    @pytest.mark.integration
     def test_shuffle_train_does_not_change_val_output(self, three_feat_splits, tmp_path):
         """
         Shuffling train rows must not change the val output
@@ -612,14 +607,12 @@ class TestNoDataLeakage:
         result1 = run_pipeline(
             train, val, test,
             artifacts_dir=tmp_path / "run1",
-            auto_track_dvc=False,
         )
 
         train_shuffled = train.sample(frac=1, random_state=99).reset_index(drop=True)
         result2 = run_pipeline(
             train_shuffled, val, test,
             artifacts_dir=tmp_path / "run2",
-            auto_track_dvc=False,
         )
 
         np.testing.assert_array_almost_equal(result1.X_val, result2.X_val)
@@ -641,6 +634,7 @@ class TestNoDataLeakage:
         X_val_2 = pipeline.transform(val.drop(columns=[_TARGET]))
         np.testing.assert_array_equal(X_val_1, X_val_2)
 
+    @pytest.mark.integration
     def test_same_seed_same_result(self, feat_df, tmp_path):
         """
         Determinism check: same data, same config -> identical output.
@@ -652,12 +646,10 @@ class TestNoDataLeakage:
         result1 = run_pipeline(
             train, val, test,
             artifacts_dir=tmp_path / "r1",
-            auto_track_dvc=False,
         )
         result2 = run_pipeline(
             train, val, test,
             artifacts_dir=tmp_path / "r2",
-            auto_track_dvc=False,
         )
 
         np.testing.assert_array_almost_equal(result1.X_train, result2.X_train)
