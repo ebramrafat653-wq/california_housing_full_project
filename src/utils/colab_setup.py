@@ -9,28 +9,32 @@ DVC remote type : local path on Drive  (/content/drive/MyDrive/dvc_storage).
 
 Session workflow:
   1. mount_drive()
-  2. setup_drive_symlinks()   ← data/ and models/ → Drive
-  3. configure_ssh()
-  4. clone_or_update_repo()
-  5. install_dependencies()
-  6. initialize_dvc()         ← first time: init + configure; later: no-op
+  2. configure_ssh()
+  3. clone_or_update_repo()
+  4. setup_drive_symlinks()   ← AFTER clone (repo must exist)
+  5. install_dependencies()   ← Uses pyproject.toml ONLY
+  6. initialize_dvc()         ← always ensures remote + cache are set
   7. dvc_pull()               ← pull data/raw from Drive remote
   8. sys.path + os.chdir()
 """
 
 import json
 import os
-import sys
 import shutil
 import subprocess
+import sys
 from pathlib import Path
-from typing import Optional, List, Union
+from typing import Optional, Union
 
 from src.utils.logger import get_logger
 from src.utils.paths import (
-    IN_COLAB, PROJECT_NAME, DRIVE_BASE,
-    DVC_REMOTE_NAME, DVC_STORAGE,
-    setup_drive_symlinks, configure_git_identity,
+    DRIVE_BASE,
+    DVC_REMOTE_NAME,
+    DVC_STORAGE,
+    IN_COLAB,
+    PROJECT_NAME,
+    configure_git_identity,
+    setup_drive_symlinks,
 )
 
 try:
@@ -123,7 +127,7 @@ def mount_drive() -> Path:
         logger.info("Drive mounted successfully")
         return drive_base
     except ImportError:
-        raise RuntimeError("google.colab not available")
+        raise RuntimeError("google.colab not available") from None
     except Exception as e:
         raise RuntimeError(f"Drive mount failed: {e}") from e
 
@@ -199,29 +203,47 @@ def clone_or_update_repo(
 
 
 # =============================================================================
-# STEP 4 — DEPENDENCIES
+# STEP 4 — DEPENDENCIES (pyproject.toml ONLY)
 # =============================================================================
 
-def install_dependencies(req_file: Optional[Union[str, Path]] = None) -> bool:
-    """Install pip requirements (Colab only)."""
+def install_dependencies(install_dev: bool = True) -> bool:
+    """
+    Install project dependencies from pyproject.toml (Colab only).
+
+    Uses `pip install -q -e .` (or `.[dev]` if install_dev is True).
+    The editable install (-e) ensures any code edits made directly in
+    Colab are immediately reflected without needing to reinstall.
+    """
     if not IN_COLAB:
         logger.debug("Skipping dependency install outside Colab")
         return True
 
-    req = Path(req_file) if req_file else Path("requirements.txt")
-    if not req.exists():
-        logger.warning(f"requirements.txt not found: {req} — skipping")
-        return True
+    pyproject = Path("pyproject.toml")
+    if not pyproject.exists():
+        logger.error(
+            f"pyproject.toml not found at {pyproject.absolute()}. "
+            "Cannot install dependencies. Ensure you are in the repo root."
+        )
+        return False
 
-    logger.info("Installing dependencies…")
-    ok = _run(f"pip install -q -r {req}", timeout=300)
+    logger.info("Installing dependencies from pyproject.toml…")
+
+    extra = ".[dev]" if install_dev else "."
+    cmd = f"pip install -q -e {extra}"
+
+    # Increased timeout to 600s because dev deps (like mypy, ipykernel)
+    # and ML libs can take a while to build/install in Colab.
+    ok = _run(cmd, timeout=600)
+
     if ok:
-        logger.info("Dependencies installed")
+        logger.info("✅ Dependencies installed successfully")
+    else:
+        logger.error("❌ Dependency installation failed")
     return ok
 
 
 # =============================================================================
-# STEP 5 — DVC INITIALIZATION
+# STEP 5 — DVC INITIALIZATION (ALWAYS CONFIGURE REMOTE + CACHE)
 # =============================================================================
 
 def _ensure_dvc_installed(repo_path: Path) -> bool:
@@ -245,8 +267,12 @@ def initialize_dvc(
     git_user_email: str = "colab@bot.local",
 ) -> bool:
     """
-    First time → dvc init + cache on Drive + local remote on Drive + git push
-    Subsequent → .dvc/ already cloned from GitHub → just verify DVC installed
+    Ensure DVC is initialized and the Drive remote + cache are configured.
+
+    Unlike the previous version, this function ALWAYS checks/reconfigures
+    the remote and cache in every session, because the Drive remote may
+    have been lost or changed, and we want DVC to use the Drive cache
+    (not the local .dvc/cache) to avoid re-downloading large files.
     """
     if not IN_COLAB:
         logger.debug("Not in Colab — skipping DVC init")
@@ -256,27 +282,39 @@ def initialize_dvc(
         logger.error("DVC installation failed")
         return False
 
-    if (repo_path / ".dvc").exists():
-        logger.info("✅ DVC already initialized (config from GitHub)")
-        return True
+    # -------------------------------------------------------------------------
+    # 1. Initialize DVC if not already done
+    # -------------------------------------------------------------------------
+    if not (repo_path / ".dvc").exists():
+        logger.info("First-time DVC initialization…")
+        if not _run("dvc init", cwd=repo_path, timeout=60):
+            logger.error("dvc init failed")
+            return False
+        logger.info("DVC initialized locally")
+    else:
+        logger.info("DVC already initialized (using existing .dvc/)")
 
-    logger.info("First-time DVC initialization…")
-
-    # 1. dvc init
-    if not _run("dvc init", cwd=repo_path, timeout=60):
-        logger.error("dvc init failed")
-        return False
-
-    # 2. DVC cache on Drive (survives session restarts — no re-download needed)
+    # -------------------------------------------------------------------------
+    # 2. Always configure DVC cache on Drive (survives session restarts)
+    # -------------------------------------------------------------------------
     drive_cache = DRIVE_BASE / f"{PROJECT_NAME}_dvc_cache"
     drive_cache.mkdir(parents=True, exist_ok=True)
-    _run(f"dvc cache dir '{drive_cache}'",  cwd=repo_path)
-    _run("dvc config cache.type symlink",   cwd=repo_path)
-    _run("dvc config cache.protected true", cwd=repo_path)
+
+    if not _run(f"dvc cache dir '{drive_cache}'", cwd=repo_path):
+        logger.warning("Failed to set DVC cache directory — using default")
+
+    _run("dvc config cache.type symlink", cwd=repo_path, silent=True)
+    _run("dvc config cache.protected true", cwd=repo_path, silent=True)
     logger.info(f"DVC cache → {drive_cache}")
 
-    # 3. DVC remote = local path on Drive (no OAuth, no internet for push/pull)
+    # -------------------------------------------------------------------------
+    # 3. Always configure DVC remote (local path on Drive)
+    # -------------------------------------------------------------------------
     DVC_STORAGE.mkdir(parents=True, exist_ok=True)
+
+    # Remove existing remote if it exists, then add fresh
+    _run(f"dvc remote remove {DVC_REMOTE_NAME}", cwd=repo_path, silent=True, timeout=10)
+
     if not _run(
         f"dvc remote add -d -f {DVC_REMOTE_NAME} '{DVC_STORAGE}'",
         cwd=repo_path, timeout=30,
@@ -285,31 +323,31 @@ def initialize_dvc(
         return False
     logger.info(f"DVC remote '{DVC_REMOTE_NAME}' → {DVC_STORAGE}")
 
-    # 4. Commit .dvc/config to GitHub (so next session clones it automatically)
+    # -------------------------------------------------------------------------
+    # 4. Commit .dvc/config changes if any (so GitHub tracks the remote)
+    # -------------------------------------------------------------------------
     configure_git_identity(repo_path)
+
+    # Stage .dvc/config if it changed
     _run("git add .dvc/config .dvcignore", cwd=repo_path, silent=True)
 
     has_changes = bool(_run_out("git status --porcelain", cwd=repo_path))
     if has_changes:
         _run(
-            "git commit -m 'chore: initialize DVC with Drive local remote'",
+            "git commit -m 'chore: update DVC remote/cache configuration'",
             cwd=repo_path, timeout=60,
         )
         ok = _run("git push", cwd=repo_path, timeout=120)
         if not ok:
             ok = _run("git push -u origin HEAD", cwd=repo_path, timeout=120)
         if ok:
-            logger.info("✅ .dvc/config pushed to GitHub")
+            logger.info("✅ .dvc/config changes pushed to GitHub")
         else:
-            logger.error(
-                "git push FAILED.\n"
-                "Check: GitHub → Settings → SSH keys has Read/Write scope."
-            )
-            return False
+            logger.error("git push failed — remote config only local")
     else:
-        logger.info("No git changes to commit")
+        logger.info("No changes to .dvc/config")
 
-    logger.info("✅ DVC initialized successfully")
+    logger.info("✅ DVC ready (remote + cache verified)")
     return True
 
 
@@ -318,7 +356,7 @@ def initialize_dvc(
 # =============================================================================
 
 def dvc_pull(
-    targets: Optional[List[str]] = None,
+    targets: Optional[list[str]] = None,
     repo_path: Optional[Path] = None,
     force: bool = False,
     timeout: int = 300,
@@ -370,7 +408,7 @@ def initialize_environment(
     ssh_key_path:     Optional[Union[str, Path]] = None,
     install_deps:     bool = True,
     dvc_auto_pull:    bool = True,
-    dvc_pull_targets: Optional[List[str]] = None,   # None → ["data/raw"]
+    dvc_pull_targets: Optional[list[str]] = None,   # None → ["data/raw"]
     dvc_force_pull:   bool = False,
     git_user_name:    str = "Colab Bot",
     git_user_email:   str = "colab@bot.local",
@@ -400,24 +438,27 @@ def initialize_environment(
     # 1. Mount Drive
     mount_drive()
 
-    # 2. Symlinks (data/ and models/ → Drive) — BEFORE clone so paths exist
-    setup_drive_symlinks()
-
-    # 3. SSH
+    # 2. SSH
     ssh_ok = configure_ssh(ssh_key_path)
     if not ssh_ok:
         logger.warning("SSH unavailable — falling back to HTTPS (git push will fail)")
 
-    # 4. Clone / pull repo
+    # 3. Clone / pull repo
     repo_path = Path(f"/content/{repo_name}")
     if not clone_or_update_repo(repo_owner, repo_name, repo_path, ssh_ok):
         raise RuntimeError("Repository clone/update failed")
 
-    # 5. Dependencies
-    if install_deps:
-        install_dependencies(repo_path / "requirements.txt")
+    # 4. NOW create Drive symlinks (after repo exists)
+    setup_drive_symlinks()
+    logger.info("Drive symlinks created (data/ and models/ → Drive)")
 
-    # 6. DVC init
+    # 5. Dependencies (pyproject.toml only)
+    if install_deps:
+        # Ensure we are in the repo root before installing so pip finds pyproject.toml
+        os.chdir(repo_path)
+        install_dependencies(install_dev=True)
+
+    # 6. DVC init (always verifies remote + cache)
     dvc_ok = initialize_dvc(
         repo_path,
         git_user_name=git_user_name,

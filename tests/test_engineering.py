@@ -17,26 +17,26 @@
 #   7.  TestNoDataLeakage          — pure math, no fit on train
 # =============================================================================
 
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import pytest
 import yaml
-from pathlib import Path
 
 from src.features.engineering import (
-    FeatureEngineeringError,
-    FeatureConfig,
-    EngineeringResult,
-    load_feature_config,
-    add_ratio_features,
-    add_distance_features,
-    drop_raw_columns,
-    run_feature_engineering,
-    _FALLBACK_RATIOS,
     _FALLBACK_DISTANCES,
     _FALLBACK_DROP_COLS,
+    _FALLBACK_RATIOS,
+    EngineeringResult,
+    FeatureConfig,
+    FeatureEngineeringError,
+    add_distance_features,
+    add_ratio_features,
+    drop_raw_columns,
+    load_feature_config,
+    run_feature_engineering,
 )
-
 
 # =============================================================================
 # SHARED FIXTURES

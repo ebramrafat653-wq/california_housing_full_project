@@ -18,28 +18,27 @@ Compatible with ingestion.py API:
 """
 
 import subprocess
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
-from datetime import datetime
 
 import pytest
 import yaml
 
 from src.data.ingestion import (
-    FileInfo,
     DownloadReport,
-    load_config,
-    setup_kaggle_credentials,
+    FileInfo,
     download_from_kaggle,
-    verify_download_integrity,
-    save_download_report,
-    track_with_dvc,
-    pull_from_dvc,
     download_with_dvc_fallback,
+    load_config,
+    pull_from_dvc,
     run_ingestion,
+    save_download_report,
+    setup_kaggle_credentials,
+    track_with_dvc,
+    verify_download_integrity,
 )
 from src.utils.colab_setup import dvc_pull
-
 
 # =============================================================================
 # FIXTURES
@@ -153,7 +152,7 @@ class TestDownloadReport:
 
     def test_summary_output(self, tmp_path: Path) -> None:
         """Verify summary() generates human-readable output.
-        
+
         ingestion.py summary format:
             Source   : kaggle   (with spaces around colon)
         """
@@ -216,7 +215,7 @@ class TestLoadConfig:
 
     def test_load_missing_config_raises(self) -> None:
         """Verify FileNotFoundError when config path doesn't exist.
-        
+
         ingestion.py raises: FileNotFoundError(f"Config not found: {target}")
         """
         with pytest.raises(FileNotFoundError, match="Config not found"):
@@ -746,7 +745,7 @@ class TestRunIngestion:
 
     def test_ingestion_missing_kaggle_id_raises(self, mock_config_yaml: Path) -> None:
         """Verify ValueError when config lacks required kaggle_id field.
-        
+
         ingestion.py: raise ValueError("Config missing: dataset.kaggle_id")
         """
         with patch("src.data.ingestion.load_config") as mock_load:

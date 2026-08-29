@@ -25,11 +25,12 @@
 
 from __future__ import annotations
 
-import sys 
-import yaml
-import pandas as pd
-from pathlib import Path
+import sys
 from dataclasses import dataclass, field
+from pathlib import Path
+
+import pandas as pd
+import yaml
 
 from src.data.data_loader import DataLoader
 from src.utils.logger import get_logger
@@ -94,7 +95,7 @@ def _load_config(config_path: str | Path) -> dict:
     config_path = Path(config_path)
     if not config_path.exists():
         raise FileNotFoundError(f"Config file not found: {config_path}")
-    with open(config_path, "r", encoding="utf-8") as f:
+    with open(config_path, encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 

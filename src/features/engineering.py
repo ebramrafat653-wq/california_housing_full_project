@@ -34,7 +34,6 @@ import yaml
 from src.utils.logger import get_logger
 from src.utils.paths import ensure_path
 
-
 logger = get_logger(__name__)
 
 
@@ -126,7 +125,7 @@ def load_feature_config(
         )
 
     try:
-        with open(config_path, "r", encoding="utf-8") as file:
+        with open(config_path, encoding="utf-8") as file:
             cfg = yaml.safe_load(file)
 
     except yaml.YAMLError as exc:

@@ -40,7 +40,6 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import yaml
-
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import (
@@ -51,7 +50,6 @@ from sklearn.preprocessing import (
 
 from src.utils.logger import get_logger
 from src.utils.paths import PROJECT_DIR
-
 
 logger = get_logger(__name__)
 
@@ -87,7 +85,7 @@ def load_features_config(
         raise PipelineError(f"Config file not found: {config_path}")
 
     try:
-        with open(config_path, "r", encoding="utf-8") as f:
+        with open(config_path, encoding="utf-8") as f:
             cfg = yaml.safe_load(f)
     except yaml.YAMLError as exc:
         raise PipelineError(f"Failed to parse YAML config: {config_path}") from exc
@@ -467,7 +465,7 @@ def fit_transform_pipeline(
     # -------------------------------------------------------------------------
     # TARGET LEAKAGE GUARD
     # -------------------------------------------------------------------------
-    
+
     forbidden = {"is_capped"}
     leaked = forbidden.intersection(X_train.columns)
     if leaked:
@@ -720,7 +718,7 @@ def run_pipeline(
     logger.info(
         "Step 1/6 — Loading features configuration..."
     )
-    
+
     config = load_features_config(Path(config_path))
 
     # -------------------------------------------------------------------------

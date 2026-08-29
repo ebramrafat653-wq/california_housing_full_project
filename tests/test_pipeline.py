@@ -19,26 +19,26 @@
 #   8.  TestNoDataLeakage         — val/test not influencing fit
 # =============================================================================
 
+import pickle
+
 import numpy as np
 import pandas as pd
-import pickle
 import pytest
 from sklearn.pipeline import Pipeline
 
 from src.features.pipeline import (
+    _STD_SCALE_COLS,
+    _TARGET,
     PipelineError,
     PipelineResult,
-    resolve_columns,
     build_pipeline,
     fit_transform_pipeline,
     get_feature_names,
-    save_pipeline,
     load_pipeline,
+    resolve_columns,
     run_pipeline,
-    _STD_SCALE_COLS,
-    _TARGET,
+    save_pipeline,
 )
-
 
 # =============================================================================
 # SHARED FIXTURES
@@ -203,7 +203,7 @@ class TestBuildPipeline:
     def test_pipeline_not_yet_fitted(self, resolved_cols):
         pipeline = build_pipeline(resolved_cols)
         import pytest
-        with pytest.raises(Exception):   # NotFittedError on transform
+        with pytest.raises(AttributeError):   
             pipeline.transform(pd.DataFrame({"dummy": [1]}))
 
 

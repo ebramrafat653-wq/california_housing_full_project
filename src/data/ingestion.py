@@ -19,14 +19,18 @@ import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional
 
 import yaml
 
 from src.utils.logger import get_logger
 from src.utils.paths import (
-    PATHS, PROJECT_DIR, ensure_path, is_dvc_initialized,
-    DVC_REMOTE_NAME, configure_git_identity,
+    DVC_REMOTE_NAME,
+    PATHS,
+    PROJECT_DIR,
+    configure_git_identity,
+    ensure_path,
+    is_dvc_initialized,
 )
 
 logger = get_logger(__name__)
@@ -66,9 +70,9 @@ class DownloadReport:
     success: bool
     dataset_id: str
     destination: Path
-    files: List[FileInfo] = field(default_factory=list)
-    errors: List[str] = field(default_factory=list)
-    warnings: List[str] = field(default_factory=list)
+    files: list[FileInfo] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
     total_size_mb: float = 0.0
     timestamp: datetime = field(default_factory=datetime.now)
     source: Optional[str] = None  # "kaggle" | "dvc"
@@ -110,7 +114,7 @@ def load_config(config_path: Optional[Path] = None) -> dict:
     target = config_path or (PATHS["configs"] / "data_config.yaml")
     if not target.exists():
         raise FileNotFoundError(f"Config not found: {target}")
-    with open(target, "r", encoding="utf-8") as f:
+    with open(target, encoding="utf-8") as f:
         config = yaml.safe_load(f)
     logger.info(f"Config loaded: {target}")
     return config
@@ -149,7 +153,7 @@ def setup_kaggle_credentials(credentials_path: Optional[Path] = None) -> bool:
 # KAGGLE DOWNLOAD
 # =============================================================================
 
-def _run_kaggle(args: List[str], timeout: int = 300) -> None:
+def _run_kaggle(args: list[str], timeout: int = 300) -> None:
     """Run kaggle CLI command; raise RuntimeError on failure."""
     cmd = ["kaggle"] + args
     logger.debug(f"Running: {' '.join(cmd)}")
@@ -161,9 +165,9 @@ def _run_kaggle(args: List[str], timeout: int = 300) -> None:
         raise RuntimeError(f"kaggle CLI error: {r.stderr.strip()}")
 
 
-def _scan_directory(directory: Path, skip_zip: bool = True) -> tuple[List[FileInfo], float]:
+def _scan_directory(directory: Path, skip_zip: bool = True) -> tuple[list[FileInfo], float]:
     """Scan directory; return (FileInfo list, total_mb)."""
-    infos: List[FileInfo] = []
+    infos: list[FileInfo] = []
     total = 0.0
     for fp in directory.iterdir():
         if not fp.is_file():
@@ -212,7 +216,7 @@ def download_from_kaggle(
 
     after    = {f.name for f in destination.iterdir() if f.is_file()}
     new_names = after - before
-    infos: List[FileInfo] = []
+    infos: list[FileInfo] = []
     total = 0.0
 
     for name in new_names:
@@ -441,7 +445,7 @@ def download_with_dvc_fallback(
 
 def verify_download_integrity(
     directory: Path,
-    expected_files: Optional[List[str]] = None,
+    expected_files: Optional[list[str]] = None,
 ) -> dict:
     """
     Verify files exist and expected list is satisfied.

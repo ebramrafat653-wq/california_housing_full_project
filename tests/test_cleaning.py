@@ -39,31 +39,28 @@
 # =============================================================================
 
 import json
-import pickle
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import pytest
 import yaml
-from pathlib import Path
 
 from src.data.cleaning import (
+    _TARGET,
     CleaningError,
     CleaningResult,
     EdaConfig,
-    load_eda_config,
-    validate_cleaning_inputs,
-    fit_imputer,
     apply_imputer,
-    fit_lof,
     apply_lof_flag,
-    save_artifacts,
+    fit_imputer,
+    fit_lof,
     load_artifacts,
-    save_cleaned_splits,
+    load_eda_config,
     run_cleaning,
-    _TARGET,
+    save_artifacts,
+    validate_cleaning_inputs,
 )
-
 
 # =============================================================================
 # SHARED FIXTURES
@@ -909,7 +906,7 @@ class TestLeakagePrevention:
 
         train_median = train["total_bedrooms"].median()
         # sanity: make sure val's own median differs enough to catch a bug
-        val_only_median = val["total_bedrooms"].median()
+        val["total_bedrooms"].median()
 
         stats = fit_imputer(train, ["total_bedrooms"], {})
         val_result = apply_imputer(val, stats, ["total_bedrooms"], "val")
@@ -939,7 +936,7 @@ class TestLeakagePrevention:
 
     def test_full_pipeline_train_stats_reused_for_val_test(self, three_splits, eda_config_yaml, tmp_path):
         train, val, test = three_splits
-        result = run_cleaning(
+        run_cleaning(
             train, val, test,
             config_path=eda_config_yaml,
             output_dir=tmp_path / "processed",

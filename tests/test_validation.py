@@ -12,25 +12,25 @@
 # because mock_config_yaml in conftest is intentionally minimal.
 # =============================================================================
 
-import pytest
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
-from pathlib import Path
+import pytest
 
 from src.data.validation import (
     ValidationError,
     ValidationReport,
-    validate_dataframe,
-    _check_not_empty,
-    _check_required_columns,
-    _check_fully_null_columns,
-    _check_target_column,
-    _check_missing_values,
-    _check_duplicates,
     _check_categorical_values,
+    _check_duplicates,
+    _check_fully_null_columns,
+    _check_missing_values,
+    _check_not_empty,
     _check_numeric_boundaries,
+    _check_required_columns,
+    _check_target_column,
+    validate_dataframe,
 )
-
 
 # =============================================================================
 # HELPERS & FIXTURES
@@ -347,7 +347,7 @@ class TestCheckDuplicates:
         assert "duplicate" in report.warnings[0].lower()
 
     def test_warning_count_reflects_actual_dupes(self, sample_california_housing_df):
-            df = pd.concat([sample_california_housing_df] * 2, ignore_index=True)  
+            df = pd.concat([sample_california_housing_df] * 2, ignore_index=True)
             report = fresh_report()
             _check_duplicates(df, report)
             # 6 rows total, 3 originals → 3 duplicates

@@ -71,9 +71,8 @@ import pickle
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
-import numpy as np
 import pandas as pd
 import yaml
 from sklearn.neighbors import LocalOutlierFactor
@@ -81,7 +80,6 @@ from sklearn.preprocessing import StandardScaler
 
 from src.utils.logger import get_logger
 from src.utils.paths import PROJECT_DIR, ensure_path
-
 
 logger = get_logger(__name__)
 
@@ -203,7 +201,7 @@ def load_eda_config(
     # -------------------------------------------------------------------------
 
     try:
-        with open(config_path, "r", encoding="utf-8") as f:
+        with open(config_path, encoding="utf-8") as f:
             cfg = yaml.safe_load(f)
     except yaml.YAMLError as exc:
         raise CleaningError(
@@ -287,7 +285,7 @@ def load_eda_config(
 
     if not isinstance(target_summary, dict):
         raise CleaningError(
-            f"'eda_derived.target_summary' is missing or invalid."
+            "'eda_derived.target_summary' is missing or invalid."
         )
 
     if "cap_threshold" not in target_summary:
@@ -413,9 +411,9 @@ class CleaningResult:
     val: pd.DataFrame
     test: pd.DataFrame
 
-    train_path: Optional[Path] = None
-    val_path: Optional[Path] = None
-    test_path: Optional[Path] = None
+    train_path: Path | None = None
+    val_path: Path | None = None
+    test_path: Path | None = None
 
     imputation_statistics: dict[str, Any] = field(
         default_factory=dict
@@ -1024,7 +1022,7 @@ def save_artifacts(
     lof_scaler: StandardScaler,
     lof_features: list[str],
     eda_config: EdaConfig,
-    output_dir: Optional[Path] = None,
+    output_dir: Path | None = None,
 ) -> Path:
     """
     Save train-fitted cleaning artifacts.
@@ -1129,7 +1127,7 @@ def save_artifacts(
 
 
 def load_artifacts(
-    artifacts_dir: Optional[Path] = None,
+    artifacts_dir: Path | None = None,
 ) -> tuple[
     dict[str, Any],
     LocalOutlierFactor,
@@ -1183,7 +1181,6 @@ def load_artifacts(
 
     with open(
         metadata_path,
-        "r",
         encoding="utf-8",
     ) as f:
 
@@ -1229,7 +1226,7 @@ def load_artifacts(
 
 def save_cleaned_splits(
     result: CleaningResult,
-    output_dir: Optional[Path] = None,
+    output_dir: Path | None = None,
 ) -> CleaningResult:
     """
     Save cleaned train/validation/test datasets.
@@ -1299,8 +1296,8 @@ def run_cleaning(
     val: pd.DataFrame,
     test: pd.DataFrame,
     config_path: str | Path = _DEFAULT_CONFIG_PATH,
-    output_dir: Optional[Path] = None,
-    artifacts_dir: Optional[Path] = None,
+    output_dir: Path | None = None,
+    artifacts_dir: Path | None = None,
     save_artifacts_flag: bool = True,
 ) -> CleaningResult:
     """

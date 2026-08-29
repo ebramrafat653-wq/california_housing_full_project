@@ -14,7 +14,7 @@ from typing import Literal
 import pandas as pd
 
 from src.utils.logger import get_logger
-from src.utils.paths import PATHS, IN_COLAB
+from src.utils.paths import IN_COLAB, PATHS
 
 DataStage = Literal["raw", "interim", "processed"]
 

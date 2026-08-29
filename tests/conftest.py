@@ -11,14 +11,15 @@ This module:
 
 import logging
 import sys
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Iterator, Optional
+from typing import Optional
 
 import numpy as np
 import pandas as pd
 import pytest
-from sklearn.pipeline import Pipeline
 from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
 
 from src.utils.logger import get_logger, setup_logging
 
@@ -42,7 +43,7 @@ def _copy_fitted_attributes_for_test(
     if name not in ct.named_transformers_:
         return
     fitted = ct.named_transformers_[name]
-    for i, (t_name, trans, cols) in enumerate(ct.transformers):
+    for _i, (t_name, trans, _cols) in enumerate(ct.transformers):
         if t_name == name:
             for attr in attr_list:
                 if hasattr(fitted, attr):
@@ -56,14 +57,14 @@ _original_pipeline_fit = Pipeline.fit
 def _patched_pipeline_fit(self, X, y=None, **fit_params):
     """Pipeline.fit() wrapper that applies the workaround after fitting."""
     result = _original_pipeline_fit(self, X, y, **fit_params)
-    
+
     # Apply workaround if pipeline has a preprocessor step (ColumnTransformer)
     if "preprocessor" in self.named_steps:
         ct = self.named_steps["preprocessor"]
         if isinstance(ct, ColumnTransformer):
             _copy_fitted_attributes_for_test(ct, "std_scaler", ["mean_", "scale_", "var_", "n_samples_seen_"])
             _copy_fitted_attributes_for_test(ct, "robust_scaler", ["center_", "scale_"])
-    
+
     return result
 
 
@@ -92,8 +93,8 @@ def resolve_project_root(
         RuntimeError: If no valid project root can be determined.
     """
     search_paths = candidates or [
-        Path("/content/california_housing_full_project"),  
-        Path.cwd().resolve(),                              
+        Path("/content/california_housing_full_project"),
+        Path.cwd().resolve(),
     ]
 
     for candidate in search_paths:
@@ -180,7 +181,7 @@ def test_data_dir(project_root: Path) -> Path:
 def sample_california_housing_df() -> pd.DataFrame:
     """
     Provide a minimal valid California Housing DataFrame for testing.
-    Matches the Kaggle schema and includes intentional flaws (NaNs, Outliers) 
+    Matches the Kaggle schema and includes intentional flaws (NaNs, Outliers)
     to test the DataCleaner.
     """
     data = {
@@ -188,11 +189,11 @@ def sample_california_housing_df() -> pd.DataFrame:
         "latitude": [37.88, 37.86, 37.85],
         "housing_median_age": [41.0, 21.0, 52.0],
         "total_rooms": [880.0, 7099.0, 1467.0],
-        "total_bedrooms": [129.0, np.nan, 190.0],  
+        "total_bedrooms": [129.0, np.nan, 190.0],
         "population": [322.0, 2401.0, 496.0],
         "households": [126.0, 1138.0, 177.0],
         "median_income": [8.3252, 8.3014, 7.2574],
-        "median_house_value": [452600.0, 358500.0, 500001.0], 
+        "median_house_value": [452600.0, 358500.0, 500001.0],
         "ocean_proximity": ["NEAR BAY", "NEAR BAY", "NEAR BAY"]
     }
     return pd.DataFrame(data)
@@ -273,7 +274,7 @@ validation:
 @pytest.fixture(scope="function")
 def skewed_mock_df() -> pd.DataFrame:
     """
-    Provide a DataFrame with heavily right-skewed numerical features 
+    Provide a DataFrame with heavily right-skewed numerical features
     specifically for testing transformations like log1p.
     """
     np.random.seed(42)

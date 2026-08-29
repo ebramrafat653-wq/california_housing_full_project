@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 from src.data.data_loader import DataLoader, DataStage
-from src.utils.paths import PATHS, IN_COLAB
+from src.utils.paths import IN_COLAB, PATHS
 
 
 @pytest.fixture(scope="module")

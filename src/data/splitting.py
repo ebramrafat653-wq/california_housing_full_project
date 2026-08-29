@@ -25,26 +25,24 @@
 
 from __future__ import annotations
 
-import sys
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
 import pandas as pd
 import yaml
 from sklearn.model_selection import train_test_split
+
 from src.data.data_loader import DataLoader
-
-
 from src.utils.logger import get_logger
 from src.utils.paths import (
-    PROJECT_DIR,
     DVC_REMOTE_NAME,
-    is_dvc_initialized,
-    ensure_path,
+    PROJECT_DIR,
     configure_git_identity,
+    ensure_path,
+    is_dvc_initialized,
 )
 
 logger = get_logger(__name__)
@@ -66,9 +64,9 @@ class SplitResult:
     val: pd.DataFrame
     test: pd.DataFrame
 
-    train_path: Optional[Path] = None
-    val_path:   Optional[Path] = None
-    test_path:  Optional[Path] = None
+    train_path: Path | None = None
+    val_path:   Path | None = None
+    test_path:  Path | None = None
 
     train_ratio: float = 0.0
     val_ratio:   float = 0.0
@@ -188,7 +186,7 @@ def _verify_stratification(
 
     # Warn if val or test deviate more than 3 pp from expected
     threshold = 0.03
-    for split_name, dist, expected in [
+    for split_name, dist, _expected in [
         ("val",  val_dist,  expected_val),
         ("test", test_dist, expected_test),
     ]:
@@ -315,7 +313,7 @@ def stratified_split(
 
 def save_splits(
     result: SplitResult,
-    output_dir: Optional[Path] = None,
+    output_dir: Path | None = None,
 ) -> SplitResult:
     """
     Save train / val / test CSVs to data/interim/.
@@ -455,7 +453,7 @@ def _load_split_config(config_path: Path) -> dict:
     """Extract the `split` section from data_config.yaml."""
     if not config_path.exists():
         raise FileNotFoundError(f"Config not found: {config_path}")
-    with open(config_path, "r", encoding="utf-8") as f:
+    with open(config_path, encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
     return cfg
 
@@ -467,7 +465,7 @@ def _load_split_config(config_path: Path) -> dict:
 def run_splitting(
     df: pd.DataFrame,
     config_path: str | Path = "configs/data_config.yaml",
-    output_dir: Optional[Path] = None,
+    output_dir: Path | None = None,
     auto_track_dvc: bool = True,
 ) -> SplitResult:
     """
