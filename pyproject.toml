@@ -1,7 +1,15 @@
+# =============================================================================
+# CALIFORNIA HOUSING FULL PROJECT — pyproject.toml
+# Modern Python Packaging Standard (PEP 621)
+# =============================================================================
+
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
+# =============================================================================
+# PROJECT METADATA
+# =============================================================================
 [project]
 name = "california-housing-full-project"
 version = "1.0.0"
@@ -11,10 +19,16 @@ requires-python = ">=3.9"
 license = {text = "MIT"}
 
 authors = [
-    {name = "Your Name", email = "your.email@example.com"}
+    {name = "Ebram Rafat", email = "ebram.rafat@example.com"}
 ]
 
-keywords = ["machine-learning", "california-housing", "dvc", "colab", "mlops"]
+keywords = [
+    "machine-learning", 
+    "california-housing", 
+    "dvc", 
+    "mlops", 
+    "production-pipeline"
+]
 
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -22,11 +36,14 @@ classifiers = [
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Intended Audience :: Developers",
 ]
 
+# Core dependencies (installed with: pip install .)
 dependencies = [
     # Core data & ML
     "pandas>=2.0.0",
@@ -48,6 +65,7 @@ dependencies = [
     "pytest>=7.4.0",
 ]
 
+# Optional dependencies (installed with: pip install .[dev])
 [project.optional-dependencies]
 dev = [
     "black>=23.0",
@@ -57,29 +75,125 @@ dev = [
     "ipykernel>=6.0",  # For Jupyter/Colab development
 ]
 
-# Optional: Let setuptools auto-discover packages (recommended)
-# [tool.setuptools.packages.find]
-# where = ["."]
-# include = ["src*"]
+# URLs for the project
+[project.urls]
+Homepage = "https://github.com/yourusername/california-housing-full-project"
+Repository = "https://github.com/yourusername/california-housing-full-project"
+Issues = "https://github.com/yourusername/california-housing-full-project/issues"
 
+# =============================================================================
+# PACKAGE DISCOVERY (Auto-discover src/ directory)
+# =============================================================================
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
+namespaces = false
+
+# =============================================================================
+# PYTEST CONFIGURATION
+# =============================================================================
 [tool.pytest.ini_options]
 minversion = "7.0"
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
+addopts = [
+    "-v",
+    "--strict-markers",
+    "-m", "not integration",  # Skip integration tests by default
+    "--tb=short",
+]
 markers = [
     "integration: end-to-end tests requiring external services (DVC, Kaggle)",
     "slow: tests that take >5 seconds",
     "requires_dvc: tests requiring DVC initialization",
 ]
-addopts = "-v --strict-markers -m 'not integration'"
 filterwarnings = [
     "ignore::DeprecationWarning",
     "ignore::UserWarning",
+    "ignore::PendingDeprecationWarning",
 ]
 
+# =============================================================================
+# RUFF CONFIGURATION (Fast Python Linter & Formatter)
+# =============================================================================
+[tool.ruff]
+target-version = "py39"
+line-length = 88
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "B",   # flake8-bugbear
+    "C4",  # flake8-comprehensions
+    "UP",  # pyupgrade
+]
+ignore = [
+    "E501",  # line too long (handled by black/formatter)
+    "B008",  # do not perform function calls in argument defaults
+    "C901",  # too complex
+]
+
+[tool.ruff.per-file-ignores]
+"__init__.py" = ["F401"]  # Allow unused imports in __init__.py
+"tests/*" = ["B011"]      # Allow assert False in tests
+
+[tool.ruff.isort]
+known-first-party = ["src"]
+
+# =============================================================================
+# MYPY CONFIGURATION (Static Type Checker)
+# =============================================================================
+[tool.mypy]
+python_version = "3.9"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false  # Gradual typing
+disallow_incomplete_defs = false
+check_untyped_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+strict_equality = true
+
+[[tool.mypy.overrides]]
+module = [
+    "pandas.*",
+    "numpy.*",
+    "sklearn.*",
+    "yaml.*",
+    "kaggle.*",
+]
+ignore_missing_imports = true
+
+# =============================================================================
+# BLACK CONFIGURATION (Code Formatter)
+# =============================================================================
+[tool.black]
+line-length = 88
+target-version = ['py39', 'py310', 'py311', 'py312']
+include = '\.pyi?$'
+extend-exclude = '''
+/(
+    \.eggs
+  | \.git
+  | \.hg
+  | \.mypy_cache
+  | \.tox
+  | \.venv
+  | _build
+  | buck-out
+  | build
+  | dist
+)/
+'''
+
+# =============================================================================
+# DVC CONFIGURATION (Optional CLI defaults)
+# =============================================================================
 [tool.dvc]
-# Default DVC CLI options (optional)
-cache_dir = ".dvc/cache"
-# Note: 'remote' here is just a name; actual config via 'dvc remote add'
+# Note: Most DVC config is done via `dvc remote add` CLI
+# This section is for optional pyproject.toml integration
