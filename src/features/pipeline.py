@@ -1,50 +1,46 @@
 # =============================================================================
 # src/features/pipeline.py
-# California Housing Project — Preprocessing & Feature Pipeline
+# California Housing Project — Preprocessing Pipeline
 #
-# Decisions source: notebooks/03_eda.ipynb → EDA Decisions Log
+# RESPONSIBILITY:
+#   Build, fit, transform, and save the preprocessing pipeline.
 #
-# WHAT THIS MODULE DOES:
-#   1. StandardScaler  on most numeric features
-#   2. RobustScaler    on median_income        (skew=1.626, not a count)
-#   3. OneHotEncoder   on ocean_proximity      (5 categories, handle_unknown=ignore)
-#   4. Passthrough     on binary/flag columns  (is_capped, lof_outlier)
+# PIPELINE POSITION:
 #
-# COLUMNS LAYOUT after engineering.py:
-#   Numeric (StandardScaler):
-#     longitude, latitude, housing_median_age,
-#     rooms_per_household, bedrooms_per_room, population_per_household,
-#     dist_SF, dist_LA
-#   Numeric (RobustScaler):
-#     median_income
-#   Categorical (OneHotEncoder):
-#     ocean_proximity
-#   Passthrough (no transform):
-#     is_capped, lof_outlier, median_house_value (target — excluded from X)
+#   cleaning.py
+#       ↓
+#   train_clean.csv / val_clean.csv / test_clean.csv
+#       ↓
+#   engineering.py
+#       ↓
+#   train_feat.csv / val_feat.csv / test_feat.csv
+#       ↓
+#   pipeline.py
+#       ↓
+#   X_train / X_val / X_test + fitted pipeline
+#       ↓
+#   training.py
 #
-# FIT/TRANSFORM RULE (prevents data leakage):
-#   Pipeline is FIT on X_train only.
-#   transform() is applied to X_val and X_test using train-fit parameters.
-#
-# INPUT  : data/processed/train_feat.csv | val_feat.csv | test_feat.csv
-# OUTPUT : preprocessed numpy arrays + fitted pipeline artifact
-#          artifacts/preprocessing_pipeline.pkl
-#
-# Run after : src/features/engineering.py
-# Run before: src/models/train.py
+# IMPORTANT:
+#   - FIT is performed on X_train ONLY.
+#   - Validation and test are transformed using train-fitted parameters.
+#   - Target-derived metadata (is_capped) is explicitly excluded.
+#   - This module does NOT manage DVC.
+#   - This module does NOT manage Git.
+#   - DVC orchestration will be handled later by dvc.yaml.
 # =============================================================================
 
 from __future__ import annotations
 
 import pickle
-import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 import pandas as pd
+import yaml
+
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import (
@@ -54,92 +50,18 @@ from sklearn.preprocessing import (
 )
 
 from src.utils.logger import get_logger
-from src.utils.paths import (
-    PROJECT_DIR,
-    DVC_REMOTE_NAME,
-    is_dvc_initialized,
-    configure_git_identity,
-)
+from src.utils.paths import PROJECT_DIR
+
 
 logger = get_logger(__name__)
 
+
 # =============================================================================
-# COLUMN DEFINITIONS
-# (updated automatically if engineering.py adds/removes features)
+# CONSTANTS
 # =============================================================================
 
-# Features scaled with StandardScaler (zero-mean, unit-variance)
-_STD_SCALE_COLS: list[str] = [
-    "longitude",
-    "latitude",
-    "housing_median_age",
-    "rooms_per_household",
-    "bedrooms_per_room",
-    "population_per_household",
-    "dist_SF",
-    "dist_LA",
-]
-
-# median_income: RobustScaler (resistant to outliers; skew=1.626 but not a count)
-_ROBUST_SCALE_COLS: list[str] = ["median_income"]
-
-# Categorical: OneHotEncoder (5 known categories, handle_unknown='ignore' for ISLAND)
-_CAT_COLS: list[str] = ["ocean_proximity"]
-
-# Passthrough: binary flags — no scaling needed
-_PASSTHROUGH_COLS: list[str] = ["is_capped", "lof_outlier"]
-
-# Target column — excluded from X
 _TARGET: str = "median_house_value"
-
-# Columns dropped before preprocessing (log1p already applied in cleaning.py;
-# raw size cols already dropped in engineering.py)
-_DROP_COLS: list[str] = []
-
-
-# =============================================================================
-# RESULT DATACLASS
-# =============================================================================
-
-@dataclass
-class PipelineResult:
-    """Holds preprocessed arrays and metadata from a pipeline run."""
-
-    X_train: np.ndarray
-    X_val:   np.ndarray
-    X_test:  np.ndarray
-
-    y_train: pd.Series
-    y_val:   pd.Series
-    y_test:  pd.Series
-
-    feature_names_out: list[str] = field(default_factory=list)
-    pipeline_path: Optional[Path] = None
-
-    n_features: int = 0
-    dvc_tracked: bool = False
-    warnings:    list[str] = field(default_factory=list)
-    timestamp:   datetime = field(default_factory=datetime.now)
-
-    def summary(self) -> str:
-        lines = [
-            "=" * 60,
-            "  PREPROCESSING PIPELINE RESULT",
-            "=" * 60,
-            f"  X_train : {self.X_train.shape}",
-            f"  X_val   : {self.X_val.shape}",
-            f"  X_test  : {self.X_test.shape}",
-            f"  y_train : {len(self.y_train):,} rows",
-            f"  Features: {self.n_features}",
-            f"  Pipeline: {self.pipeline_path or 'not saved'}",
-            f"  DVC     : {'yes' if self.dvc_tracked else 'no'}",
-        ]
-        if self.warnings:
-            lines.append("\n  Warnings:")
-            for w in self.warnings:
-                lines.append(f"    !  {w}")
-        lines.append("=" * 60)
-        return "\n".join(lines)
+_DEFAULT_CONFIG_PATH: Path = PROJECT_DIR / "configs" / "data_config.yaml"
 
 
 # =============================================================================
@@ -147,53 +69,159 @@ class PipelineResult:
 # =============================================================================
 
 class PipelineError(Exception):
-    """Raised on unrecoverable preprocessing failures."""
-    pass
+    """Raised when preprocessing cannot continue safely."""
 
 
 # =============================================================================
-# COLUMN RESOLVER
+# CONFIGURATION LOADER (FAIL-FAST)
+# =============================================================================
+
+def load_features_config(
+    config_path: Path = _DEFAULT_CONFIG_PATH,
+) -> dict[str, list[str]]:
+    """
+    Load feature lists from data_config.yaml.
+    Fails fast if the config is missing or malformed.
+    """
+    if not config_path.exists():
+        raise PipelineError(f"Config file not found: {config_path}")
+
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f)
+    except yaml.YAMLError as exc:
+        raise PipelineError(f"Failed to parse YAML config: {config_path}") from exc
+
+    features_cfg = cfg.get("features_config")
+    if not isinstance(features_cfg, dict):
+        raise PipelineError(
+            "'features_config' section is missing or invalid in data_config.yaml."
+        )
+
+    return {
+        "std": features_cfg.get("numerical_standard_scaler", []),
+        "robust": features_cfg.get("numerical_robust_scaler", []),
+        "cat": features_cfg.get("categorical_one_hot", []),
+        "passthrough": features_cfg.get("passthrough", []),
+    }
+
+
+# =============================================================================
+# RESULT
+# =============================================================================
+
+@dataclass
+class PipelineResult:
+    """
+    Container for the result of the preprocessing pipeline.
+    """
+
+    X_train: np.ndarray
+    X_val: np.ndarray
+    X_test: np.ndarray
+
+    y_train: pd.Series
+    y_val: pd.Series
+    y_test: pd.Series
+
+    feature_names_out: list[str] = field(
+        default_factory=list
+    )
+
+    pipeline_path: Path | None = None
+
+    n_features: int = 0
+
+    timestamp: datetime = field(
+        default_factory=datetime.now
+    )
+
+    warnings: list[str] = field(
+        default_factory=list
+    )
+
+    def summary(self) -> str:
+        """Return a readable summary of preprocessing results."""
+
+        lines = [
+            "=" * 60,
+            "PREPROCESSING PIPELINE RESULT",
+            "=" * 60,
+            f"X_train : {self.X_train.shape}",
+            f"X_val   : {self.X_val.shape}",
+            f"X_test  : {self.X_test.shape}",
+            f"y_train : {len(self.y_train):,}",
+            f"y_val   : {len(self.y_val):,}",
+            f"y_test  : {len(self.y_test):,}",
+            f"Features: {self.n_features}",
+            (
+                "Pipeline: "
+                f"{self.pipeline_path or 'not saved'}"
+            ),
+        ]
+
+        if self.warnings:
+            lines.append("")
+            lines.append("Warnings:")
+
+            for warning in self.warnings:
+                lines.append(f"  - {warning}")
+
+        lines.append("=" * 60)
+
+        return "\n".join(lines)
+
+
+# =============================================================================
+# COLUMN RESOLUTION
 # =============================================================================
 
 def resolve_columns(
     df: pd.DataFrame,
-    std_scale_cols: list[str] = _STD_SCALE_COLS,
-    robust_scale_cols: list[str] = _ROBUST_SCALE_COLS,
-    cat_cols: list[str] = _CAT_COLS,
-    passthrough_cols: list[str] = _PASSTHROUGH_COLS,
-    target: str = _TARGET,
+    config: dict[str, list[str]],
 ) -> dict[str, list[str]]:
     """
-    Resolve which columns exist in `df` for each transformer group.
+    Resolve expected columns against the actual DataFrame.
 
-    Logs warnings for any expected column that is missing.
-    Returns a dict with keys: std, robust, cat, passthrough.
+    Returns:
+        {
+            "std": [...],
+            "robust": [...],
+            "cat": [...],
+            "passthrough": [...]
+        }
+
+    Missing expected columns are reported as errors rather than silently
+    ignored, because silently dropping features can hide pipeline bugs.
     """
+
     all_cols = set(df.columns)
+    resolved: dict[str, list[str]] = {}
 
-    def _filter(cols: list[str], group: str) -> list[str]:
-        present = [c for c in cols if c in all_cols]
-        missing = [c for c in cols if c not in all_cols]
+    for group_name, columns in config.items():
+
+        missing = [
+            column
+            for column in columns
+            if column not in all_cols
+        ]
+
         if missing:
-            logger.warning(
-                f"Column resolver [{group}]: expected columns not found "
-                f"and will be skipped: {missing}"
+            raise PipelineError(
+                f"Missing columns for '{group_name}': "
+                f"{missing}"
             )
-        return present
 
-    resolved = {
-        "std"         : _filter(std_scale_cols,    "StandardScaler"),
-        "robust"      : _filter(robust_scale_cols, "RobustScaler"),
-        "cat"         : _filter(cat_cols,          "OneHotEncoder"),
-        "passthrough" : _filter(passthrough_cols,  "Passthrough"),
-    }
+        resolved[group_name] = list(columns)
 
     logger.info(
-        f"Column resolver: std={len(resolved['std'])}, "
+        "Columns resolved successfully | "
+        f"std={len(resolved['std'])}, "
         f"robust={len(resolved['robust'])}, "
         f"cat={len(resolved['cat'])}, "
         f"passthrough={len(resolved['passthrough'])}"
     )
+
     return resolved
 
 
@@ -205,428 +233,608 @@ def build_pipeline(
     cols: dict[str, list[str]],
 ) -> Pipeline:
     """
-    Build a sklearn Pipeline with a ColumnTransformer.
+    Build an unfitted sklearn preprocessing pipeline.
 
-    Transformers:
-      - StandardScaler on numeric (most features)
-      - RobustScaler   on median_income
-      - OneHotEncoder  on ocean_proximity (handle_unknown='ignore' for ISLAND)
-      - passthrough     on binary flag columns
+    Transformations:
 
-    Parameters
-    ----------
-    cols : dict from resolve_columns()
+        StandardScaler
+            ↓
+        Standard numeric features
 
-    Returns
-    -------
-    sklearn.pipeline.Pipeline (not yet fitted)
+        RobustScaler
+            ↓
+        median_income
+
+        OneHotEncoder
+            ↓
+        ocean_proximity
+
+        passthrough
+            ↓
+        lof_outlier (is_capped is strictly excluded)
+
+    Any unlisted column is dropped.
+    This prevents the target from entering X.
     """
+
     transformers = []
+
+    # -------------------------------------------------------------------------
+    # StandardScaler
+    # -------------------------------------------------------------------------
 
     if cols["std"]:
         transformers.append(
-            ("std_scaler", StandardScaler(), cols["std"])
+            (
+                "standard_scaler",
+                StandardScaler(),
+                cols["std"],
+            )
         )
+
+    # -------------------------------------------------------------------------
+    # RobustScaler
+    # -------------------------------------------------------------------------
 
     if cols["robust"]:
         transformers.append(
-            ("robust_scaler", RobustScaler(), cols["robust"])
+            (
+                "robust_scaler",
+                RobustScaler(),
+                cols["robust"],
+            )
         )
 
+    # -------------------------------------------------------------------------
+    # OneHotEncoder
+    # -------------------------------------------------------------------------
+
     if cols["cat"]:
-        transformers.append((
-            "ohe",
-            OneHotEncoder(
-                handle_unknown="ignore",   # ISLAND is rare (<0.1%) — ignore unseen
-                sparse_output=False,       # return dense array for compatibility
-                drop=None,                 # keep all categories (model decides)
-            ),
-            cols["cat"],
-        ))
+        transformers.append(
+            (
+                "one_hot_encoder",
+                OneHotEncoder(
+                    handle_unknown="ignore",
+                    sparse_output=False,
+                    drop=None,
+                ),
+                cols["cat"],
+            )
+        )
+
+    # -------------------------------------------------------------------------
+    # Passthrough
+    # -------------------------------------------------------------------------
 
     if cols["passthrough"]:
         transformers.append(
-            ("passthrough", "passthrough", cols["passthrough"])
+            (
+                "passthrough",
+                "passthrough",
+                cols["passthrough"],
+            )
         )
 
     if not transformers:
         raise PipelineError(
-            "No columns matched any transformer group. "
-            "Check that engineering.py ran successfully and columns exist."
+            "No preprocessing transformers were created."
         )
 
-    ct = ColumnTransformer(
+    column_transformer = ColumnTransformer(
         transformers=transformers,
-        remainder="drop",      # drop any unlisted columns (e.g. target)
+        remainder="drop",
         verbose_feature_names_out=False,
     )
 
-    pipeline = Pipeline(steps=[("preprocessor", ct)])
-    logger.info(f"Pipeline built with {len(transformers)} transformer group(s).")
+    pipeline = Pipeline(
+        steps=[
+            (
+                "preprocessor",
+                column_transformer,
+            )
+        ]
+    )
+
+    logger.info(
+        f"Preprocessing pipeline built with "
+        f"{len(transformers)} transformer groups."
+    )
+
     return pipeline
+
+
+# =============================================================================
+# INPUT VALIDATION
+# =============================================================================
+
+def validate_split_columns(
+    train: pd.DataFrame,
+    val: pd.DataFrame,
+    test: pd.DataFrame,
+    target: str = _TARGET,
+) -> None:
+    """
+    Validate that train/validation/test have compatible schemas.
+    """
+
+    for name, df in [
+        ("train", train),
+        ("val", val),
+        ("test", test),
+    ]:
+
+        if not isinstance(df, pd.DataFrame):
+            raise PipelineError(
+                f"{name} must be a pandas DataFrame."
+            )
+
+        if df.empty:
+            raise PipelineError(
+                f"{name} DataFrame is empty."
+            )
+
+        if target not in df.columns:
+            raise PipelineError(
+                f"Target '{target}' is missing from {name}."
+            )
+
+    train_features = set(train.columns) - {target}
+    val_features = set(val.columns) - {target}
+    test_features = set(test.columns) - {target}
+
+    if train_features != val_features:
+        raise PipelineError(
+            "Train and validation feature columns do not match."
+        )
+
+    if train_features != test_features:
+        raise PipelineError(
+            "Train and test feature columns do not match."
+        )
 
 
 # =============================================================================
 # FIT + TRANSFORM
 # =============================================================================
 
-def _copy_fitted_attributes(
-    ct: ColumnTransformer,
-    name: str,
-    attr_list: list[str],
-) -> None:
-    """
-    Copy fitted attributes from ct.named_transformers_[name]
-    back to the original transformer in ct.transformers.
-
-    This is a compatibility workaround for tests that inspect the
-    unfitted transformer object directly instead of using the fitted
-    copy stored in named_transformers_.
-    """
-    if name not in ct.named_transformers_:
-        return
-
-    fitted = ct.named_transformers_[name]
-    for i, (t_name, trans, cols) in enumerate(ct.transformers):
-        if t_name == name:
-            for attr in attr_list:
-                if hasattr(fitted, attr):
-                    setattr(trans, attr, getattr(fitted, attr))
-            break
-
-
 def fit_transform_pipeline(
     pipeline: Pipeline,
     train: pd.DataFrame,
-    val:   pd.DataFrame,
-    test:  pd.DataFrame,
+    val: pd.DataFrame,
+    test: pd.DataFrame,
     target: str = _TARGET,
-) -> tuple[Pipeline, np.ndarray, np.ndarray, np.ndarray,
-           pd.Series, pd.Series, pd.Series]:
+) -> tuple[
+    Pipeline,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    pd.Series,
+    pd.Series,
+    pd.Series,
+]:
     """
-    Fit pipeline on train, transform all three splits.
+    Fit preprocessing on X_train only and transform all splits.
 
-    FIT/TRANSFORM RULE:
-        pipeline.fit() is called ONLY on X_train.
-        X_val and X_test are transformed using train-fit parameters.
+    IMPORTANT:
 
-    Parameters
-    ----------
-    pipeline  : Unfitted sklearn Pipeline from build_pipeline()
-    train / val / test : Feature-engineered DataFrames from engineering.py
-    target    : Name of the target column (excluded from X)
+        pipeline.fit(X_train)
 
-    Returns
-    -------
-    (fitted_pipeline, X_train, X_val, X_test, y_train, y_val, y_test)
+    is called exactly once.
+
+    Validation and test are NEVER used to calculate:
+        - means
+        - standard deviations
+        - medians
+        - category mappings
+        - any other fitted preprocessing parameters
     """
-    if target not in train.columns:
+
+    validate_split_columns(
+        train,
+        val,
+        test,
+        target=target,
+    )
+
+    # -------------------------------------------------------------------------
+    # Separate X and y
+    # -------------------------------------------------------------------------
+
+    X_train = train.drop(
+        columns=[target]
+    )
+
+    X_val = val.drop(
+        columns=[target]
+    )
+
+    X_test = test.drop(
+        columns=[target]
+    )
+
+    y_train = train[target].reset_index(
+        drop=True
+    )
+
+    y_val = val[target].reset_index(
+        drop=True
+    )
+
+    y_test = test[target].reset_index(
+        drop=True
+    )
+
+    # -------------------------------------------------------------------------
+    # TARGET LEAKAGE GUARD
+    # -------------------------------------------------------------------------
+    
+    forbidden = {"is_capped"}
+    leaked = forbidden.intersection(X_train.columns)
+    if leaked:
         raise PipelineError(
-            f"Target column '{target}' not found in train DataFrame. "
-            "Ensure splitting.py and cleaning.py ran successfully."
+            f"Target leakage detected in X! Forbidden columns found: {leaked}. "
+            "These must be excluded before preprocessing."
         )
 
-    # Separate features and target
-    X_train = train.drop(columns=[target])
-    X_val   = val.drop(columns=[target])
-    X_test  = test.drop(columns=[target])
-
-    y_train = train[target].reset_index(drop=True)
-    y_val   = val[target].reset_index(drop=True)
-    y_test  = test[target].reset_index(drop=True)
-
-    logger.info(f"Fitting pipeline on {len(X_train):,} train rows...")
-    pipeline.fit(X_train)  # ← FIT ON TRAIN ONLY
-
-    ct = pipeline.named_steps["preprocessor"]
-    _copy_fitted_attributes(ct, "std_scaler", ["mean_", "scale_", "var_", "n_samples_seen_"])
-    _copy_fitted_attributes(ct, "robust_scaler", ["center_", "scale_"])
-
-    logger.info("Transforming train / val / test...")
-    X_train_t = pipeline.transform(X_train)
-    X_val_t   = pipeline.transform(X_val)
-    X_test_t  = pipeline.transform(X_test)
+    # -------------------------------------------------------------------------
+    # FIT — TRAIN ONLY
+    # -------------------------------------------------------------------------
 
     logger.info(
-        f"Pipeline fit complete | "
-        f"X_train: {X_train_t.shape} | "
-        f"X_val: {X_val_t.shape} | "
-        f"X_test: {X_test_t.shape}"
+        f"Fitting preprocessing pipeline "
+        f"on {len(X_train):,} training rows..."
     )
-    return pipeline, X_train_t, X_val_t, X_test_t, y_train, y_val, y_test
 
+    pipeline.fit(X_train)
 
-def get_feature_names(pipeline: Pipeline) -> list[str]:
-    """
-    Extract feature names from the fitted ColumnTransformer.
+    logger.info(
+        "Pipeline fitted successfully on TRAIN only."
+    )
 
-    Returns a flat list of output feature names, including OHE-expanded
-    category names (e.g. 'ocean_proximity_INLAND').
-    """
-    try:
-        ct = pipeline.named_steps["preprocessor"]
-        names = ct.get_feature_names_out().tolist()
-        logger.info(f"Feature names extracted: {len(names)} features")
-        return names
-    except Exception as e:
-        logger.warning(f"Could not extract feature names: {e}")
-        return []
+    # -------------------------------------------------------------------------
+    # TRANSFORM
+    # -------------------------------------------------------------------------
+
+    logger.info(
+        "Transforming train / validation / test..."
+    )
+
+    X_train_transformed = pipeline.transform(
+        X_train
+    )
+
+    X_val_transformed = pipeline.transform(
+        X_val
+    )
+
+    X_test_transformed = pipeline.transform(
+        X_test
+    )
+
+    # -------------------------------------------------------------------------
+    # Numerical safety checks
+    # -------------------------------------------------------------------------
+
+    arrays = {
+        "X_train": X_train_transformed,
+        "X_val": X_val_transformed,
+        "X_test": X_test_transformed,
+    }
+
+    for name, array in arrays.items():
+
+        if not np.isfinite(array).all():
+            raise PipelineError(
+                f"{name} contains NaN or infinite values "
+                "after preprocessing."
+            )
+
+    logger.info(
+        "Transformation complete | "
+        f"X_train={X_train_transformed.shape} | "
+        f"X_val={X_val_transformed.shape} | "
+        f"X_test={X_test_transformed.shape}"
+    )
+
+    return (
+        pipeline,
+        X_train_transformed,
+        X_val_transformed,
+        X_test_transformed,
+        y_train,
+        y_val,
+        y_test,
+    )
 
 
 # =============================================================================
-# SAVE / LOAD PIPELINE ARTIFACT
+# FEATURE NAMES
+# =============================================================================
+
+def get_feature_names(
+    pipeline: Pipeline,
+) -> list[str]:
+    """
+    Return feature names after preprocessing.
+
+    OHE categories are expanded automatically.
+
+    Example:
+        ocean_proximity_INLAND
+        ocean_proximity_NEAR BAY
+    """
+
+    try:
+
+        preprocessor = pipeline.named_steps[
+            "preprocessor"
+        ]
+
+        feature_names = (
+            preprocessor
+            .get_feature_names_out()
+            .tolist()
+        )
+
+        logger.info(
+            f"Extracted {len(feature_names)} output features."
+        )
+
+        return feature_names
+
+    except Exception as exc:
+
+        logger.error(
+            f"Could not extract feature names: {exc}"
+        )
+
+        raise PipelineError(
+            "Failed to extract preprocessing feature names."
+        ) from exc
+
+
+# =============================================================================
+# SAVE PIPELINE
 # =============================================================================
 
 def save_pipeline(
     pipeline: Pipeline,
-    output_dir: Optional[Path] = None,
+    output_dir: Path | None = None,
 ) -> Path:
     """
-    Save the fitted pipeline to artifacts/preprocessing_pipeline.pkl.
+    Save the fitted preprocessing pipeline.
 
-    This artifact is needed to:
-      - Apply identical transforms to new production data
-      - Reproduce val/test transforms exactly
-      - Serve predictions via the API (api/predict.py)
+    Output:
+        artifacts/preprocessing_pipeline.pkl
 
-    The pickle file should be tracked with DVC (binary, can be large).
+    DVC tracking is intentionally NOT performed here.
     """
-    artifacts_dir = output_dir or (PROJECT_DIR / "artifacts")
-    artifacts_dir.mkdir(parents=True, exist_ok=True)
-    path = artifacts_dir / "preprocessing_pipeline.pkl"
 
-    with open(path, "wb") as f:
-        pickle.dump(pipeline, f)
+    output_dir = (
+        output_dir
+        if output_dir is not None
+        else PROJECT_DIR / "artifacts"
+    )
 
-    size_kb = path.stat().st_size / 1024
-    logger.info(f"Pipeline saved -> {path} ({size_kb:.1f} KB)")
+    output_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    path = (
+        output_dir
+        / "preprocessing_pipeline.pkl"
+    )
+
+    with open(path, "wb") as file:
+        pickle.dump(
+            pipeline,
+            file,
+        )
+
+    size_kb = (
+        path.stat().st_size / 1024
+    )
+
+    logger.info(
+        f"Pipeline saved -> "
+        f"{path} ({size_kb:.1f} KB)"
+    )
+
     return path
 
 
-def load_pipeline(artifacts_dir: Optional[Path] = None) -> Pipeline:
-    """
-    Load a previously fitted pipeline from artifacts/.
+# =============================================================================
+# LOAD PIPELINE
+# =============================================================================
 
-    Raises FileNotFoundError if the artifact is missing.
+def load_pipeline(
+    artifacts_dir: Path | None = None,
+) -> Pipeline:
     """
-    artifacts_dir = artifacts_dir or (PROJECT_DIR / "artifacts")
-    path = artifacts_dir / "preprocessing_pipeline.pkl"
+    Load a previously fitted preprocessing pipeline.
+    """
+
+    artifacts_dir = (
+        artifacts_dir
+        if artifacts_dir is not None
+        else PROJECT_DIR / "artifacts"
+    )
+
+    path = (
+        artifacts_dir
+        / "preprocessing_pipeline.pkl"
+    )
 
     if not path.exists():
         raise FileNotFoundError(
-            f"Preprocessing pipeline not found: {path}\n"
-            "Run run_pipeline() to fit and save it first."
+            f"Preprocessing pipeline not found: {path}"
         )
 
-    with open(path, "rb") as f:
-        pipeline = pickle.load(f)
+    with open(path, "rb") as file:
+        pipeline = pickle.load(file)
 
-    logger.info(f"Pipeline loaded from {path}")
+    logger.info(
+        f"Pipeline loaded from {path}"
+    )
+
     return pipeline
 
 
 # =============================================================================
-# DVC TRACKING
-# =============================================================================
-
-def _run_cmd(
-    cmd: list[str],
-    cwd: Path,
-    timeout: int = 120,
-    raise_on_failure: bool = False,
-) -> bool:
-    """Run subprocess command with optional raise on failure."""
-    try:
-        r = subprocess.run(
-            cmd, cwd=cwd, capture_output=True,
-            text=True, errors="replace", timeout=timeout,
-        )
-    except subprocess.TimeoutExpired:
-        msg = f"Command timed out after {timeout}s: {' '.join(cmd)}"
-        logger.error(msg)
-        if raise_on_failure:
-            raise PipelineError(msg)
-        return False
-    except Exception as e:
-        msg = f"Command error: {' '.join(cmd)} — {e}"
-        logger.error(msg)
-        if raise_on_failure:
-            raise PipelineError(msg)
-        return False
-
-    if r.returncode != 0:
-        msg = f"Command failed: {' '.join(cmd)}\n  stderr: {r.stderr.strip()}"
-        if raise_on_failure:
-            logger.error(msg)
-            raise PipelineError(msg)
-        logger.warning(msg)
-        return False
-    return True
-
-
-def track_pipeline_with_dvc(
-    result: PipelineResult,
-    remote_name: str = DVC_REMOTE_NAME,
-    timeout: int = 300,
-) -> bool:
-    """Track artifacts/preprocessing_pipeline.pkl with DVC."""
-    if not is_dvc_initialized():
-        logger.warning("DVC not initialized — skipping tracking.")
-        return False
-
-    if not result.pipeline_path:
-        logger.warning("No pipeline_path in result — call save_pipeline() first.")
-        return False
-
-    try:
-        rel = result.pipeline_path.relative_to(PROJECT_DIR)
-    except ValueError:
-        logger.error(f"{result.pipeline_path} is outside PROJECT_DIR.")
-        return False
-
-    _run_cmd(
-        ["dvc", "add", str(rel)],
-        cwd=PROJECT_DIR, timeout=timeout,
-        raise_on_failure=True,
-    )
-
-    push_ok = _run_cmd(
-        ["dvc", "push", f"--remote={remote_name}", str(rel)],
-        cwd=PROJECT_DIR, timeout=timeout,
-    )
-    if not push_ok:
-        result.warnings.append("DVC push failed — run `dvc push` manually.")
-
-    configure_git_identity(PROJECT_DIR)
-    _run_cmd(
-        ["git", "add", f"{rel}.dvc"],
-        cwd=PROJECT_DIR, timeout=30,
-    )
-
-    status = subprocess.run(
-        ["git", "status", "--porcelain"],
-        cwd=PROJECT_DIR, capture_output=True,
-        text=True, errors="replace", timeout=15,
-    )
-    if not status.stdout.strip():
-        logger.info("No new git changes — pipeline artifact already tracked.")
-        result.dvc_tracked = True
-        return True
-
-    _run_cmd(
-        ["git", "commit", "-m", "feat: track preprocessing pipeline artifact with DVC"],
-        cwd=PROJECT_DIR, timeout=60,
-    )
-    ok = _run_cmd(["git", "push"], cwd=PROJECT_DIR, timeout=120)
-    if ok:
-        result.dvc_tracked = True
-    else:
-        result.warnings.append("git push failed — run `git push` manually.")
-    return ok
-
-
-# =============================================================================
-# MAIN PIPELINE ENTRY POINT
+# MAIN PIPELINE
 # =============================================================================
 
 def run_pipeline(
     train: pd.DataFrame,
-    val:   pd.DataFrame,
-    test:  pd.DataFrame,
+    val: pd.DataFrame,
+    test: pd.DataFrame,
     target: str = _TARGET,
-    std_scale_cols: list[str] = _STD_SCALE_COLS,
-    robust_scale_cols: list[str] = _ROBUST_SCALE_COLS,
-    cat_cols: list[str] = _CAT_COLS,
-    passthrough_cols: list[str] = _PASSTHROUGH_COLS,
-    artifacts_dir: Optional[Path] = None,
-    auto_track_dvc: bool = True,
+    config_path: str | Path = _DEFAULT_CONFIG_PATH,
+    artifacts_dir: Path | None = None,
     save: bool = True,
 ) -> PipelineResult:
     """
-    Full preprocessing pipeline: resolve columns → build → fit → transform → save.
+    Execute the complete preprocessing stage.
 
-    FIT/TRANSFORM RULE:
-        All scaler/encoder statistics are computed on `train` only.
-        The fitted pipeline is applied to `val` and `test` using
-        train-derived parameters — no leakage.
+    Steps:
 
-    Parameters
-    ----------
-    train / val / test   : Feature-engineered DataFrames from engineering.py
-    target               : Target column name (excluded from X)
-    std_scale_cols       : Columns for StandardScaler
-    robust_scale_cols    : Columns for RobustScaler (median_income)
-    cat_cols             : Columns for OneHotEncoder (ocean_proximity)
-    passthrough_cols     : Columns to pass through unchanged (flags)
-    artifacts_dir        : Override for artifacts directory
-    auto_track_dvc       : Track fitted pipeline with DVC
-    save                 : Save fitted pipeline to artifacts/
-
-    Returns
-    -------
-    PipelineResult with X_train, X_val, X_test, y_train, y_val, y_test arrays.
-
-    Usage
-    -----
-        from src.data.data_loader import DataLoader
-        from src.features.pipeline import run_pipeline
-
-        loader = DataLoader()
-        train  = loader.load_processed("train_feat.csv")
-        val    = loader.load_processed("val_feat.csv")
-        test   = loader.load_processed("test_feat.csv")
-
-        result = run_pipeline(train, val, test)
-        # result.X_train, result.y_train -> ready for model training
+        1. Load Config (Fail-Fast)
+        2. Validate input
+        3. Resolve feature columns
+        4. Build sklearn pipeline
+        5. Fit on train only
+        6. Transform train/validation/test
+        7. Extract feature names
+        8. Save fitted pipeline artifact
     """
+
     logger.info("=" * 60)
-    logger.info("  Preprocessing pipeline started")
+    logger.info("PREPROCESSING PIPELINE STARTED")
     logger.info("=" * 60)
 
-    # -- Input guards ----------------------------------------------------------
-    for name, df in [("train", train), ("val", val), ("test", test)]:
-        if df.empty:
-            raise PipelineError(
-                f"Input '{name}' DataFrame is empty — cannot preprocess."
-            )
-    if target not in train.columns:
-        raise PipelineError(
-            f"Target column '{target}' not found in train. "
-            "Ensure cleaning.py and engineering.py ran successfully."
-        )
+    # -------------------------------------------------------------------------
+    # Step 1 — Load Config
+    # -------------------------------------------------------------------------
 
-    # -- Step 1: Resolve columns ----------------------------------------------
-    logger.info("Step 1/4 — Resolving columns")
-    cols = resolve_columns(
-        df=train,
-        std_scale_cols=std_scale_cols,
-        robust_scale_cols=robust_scale_cols,
-        cat_cols=cat_cols,
-        passthrough_cols=passthrough_cols,
+    logger.info(
+        "Step 1/6 — Loading features configuration..."
+    )
+    
+    config = load_features_config(Path(config_path))
+
+    # -------------------------------------------------------------------------
+    # Step 2 — Validate
+    # -------------------------------------------------------------------------
+
+    logger.info(
+        "Step 2/6 — Validating input splits"
+    )
+
+    validate_split_columns(
+        train,
+        val,
+        test,
         target=target,
     )
 
-    # -- Step 2: Build pipeline -----------------------------------------------
-    logger.info("Step 2/4 — Building sklearn Pipeline")
-    pipeline = build_pipeline(cols)
+    # -------------------------------------------------------------------------
+    # Step 3 — Resolve columns
+    # -------------------------------------------------------------------------
 
-    # -- Step 3: Fit on train + transform all ---------------------------------
-    logger.info("Step 3/4 — Fit on train / transform all splits")
-    pipeline, X_train, X_val, X_test, y_train, y_val, y_test = (
-        fit_transform_pipeline(pipeline, train, val, test, target)
+    logger.info(
+        "Step 3/6 — Resolving feature columns"
     )
 
-    feature_names = get_feature_names(pipeline)
+    columns = resolve_columns(
+        df=train.drop(
+            columns=[target]
+        ),
+        config=config,
+    )
 
-    # -- Step 4: Save artifact ------------------------------------------------
+    # -------------------------------------------------------------------------
+    # Step 4 — Build pipeline
+    # -------------------------------------------------------------------------
+
+    logger.info(
+        "Step 4/6 — Building sklearn pipeline"
+    )
+
+    pipeline = build_pipeline(
+        columns
+    )
+
+    # -------------------------------------------------------------------------
+    # Step 5 — Fit + transform
+    # -------------------------------------------------------------------------
+
+    logger.info(
+        "Step 5/6 — Fit on train / transform all splits"
+    )
+
+    (
+        fitted_pipeline,
+        X_train,
+        X_val,
+        X_test,
+        y_train,
+        y_val,
+        y_test,
+    ) = fit_transform_pipeline(
+        pipeline,
+        train,
+        val,
+        test,
+        target=target,
+    )
+
+    # -------------------------------------------------------------------------
+    # Step 6 — Feature names
+    # -------------------------------------------------------------------------
+
+    logger.info(
+        "Step 6/6 — Extracting feature names"
+    )
+
+    feature_names = get_feature_names(
+        fitted_pipeline
+    )
+
+    if len(feature_names) != X_train.shape[1]:
+        raise PipelineError(
+            "Number of feature names does not match "
+            "number of transformed features."
+        )
+
+    # -------------------------------------------------------------------------
+    # Step 7 — Save
+    # -------------------------------------------------------------------------
+
     pipeline_path = None
-    if save:
-        logger.info("Step 4/4 — Saving fitted pipeline artifact")
-        pipeline_path = save_pipeline(pipeline, output_dir=artifacts_dir)
-    else:
-        logger.info("Step 4/4 — save=False, skipping artifact save.")
 
-    # -- Assemble result ------------------------------------------------------
+    if save:
+
+        logger.info(
+            "Step 7/7 — Saving fitted pipeline"
+        )
+
+        pipeline_path = save_pipeline(
+            fitted_pipeline,
+            output_dir=artifacts_dir,
+        )
+
+    else:
+
+        logger.info(
+            "Step 7/7 — save=False, "
+            "skipping artifact save."
+        )
+
+    # -------------------------------------------------------------------------
+    # Result
+    # -------------------------------------------------------------------------
+
     result = PipelineResult(
         X_train=X_train,
         X_val=X_val,
@@ -639,49 +847,64 @@ def run_pipeline(
         n_features=X_train.shape[1],
     )
 
-    # -- DVC tracking ---------------------------------------------------------
-    if auto_track_dvc and save:
-        track_pipeline_with_dvc(result)
-    else:
-        logger.info("DVC tracking skipped.")
+    logger.info(
+        "\n" + result.summary()
+    )
 
-    logger.info("\n" + result.summary())
     return result
 
 
 # =============================================================================
-# CLI  ->  python -m src.features.pipeline
+# CLI
 # =============================================================================
 
 if __name__ == "__main__":
-    import sys
+
     from src.data.data_loader import DataLoader
 
     loader = DataLoader()
 
-    logger.info("Loading feature-engineered splits...")
-    train = loader.load_processed("train_feat.csv")
-    val   = loader.load_processed("val_feat.csv")
-    test  = loader.load_processed("test_feat.csv")
+    logger.info(
+        "Loading feature-engineered splits..."
+    )
 
-    result = run_pipeline(train, val, test)
-    print(result.summary())
-    sys.exit(0)
+    train = loader.load_processed(
+        "train_feat.csv"
+    )
 
+    val = loader.load_processed(
+        "val_feat.csv"
+    )
+
+    test = loader.load_processed(
+        "test_feat.csv"
+    )
+
+    result = run_pipeline(
+        train,
+        val,
+        test,
+    )
+
+    print(
+        result.summary()
+    )
+
+
+# =============================================================================
+# PUBLIC API
+# =============================================================================
 
 __all__ = [
     "PipelineError",
     "PipelineResult",
+    "load_features_config",
     "resolve_columns",
     "build_pipeline",
+    "validate_split_columns",
     "fit_transform_pipeline",
     "get_feature_names",
     "save_pipeline",
     "load_pipeline",
     "run_pipeline",
-    "_STD_SCALE_COLS",
-    "_ROBUST_SCALE_COLS",
-    "_CAT_COLS",
-    "_PASSTHROUGH_COLS",
-    "_TARGET",
 ]
