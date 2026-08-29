@@ -14,9 +14,10 @@
 # OUTPUT FILES (saved to data/interim/ — DVC-tracked):
 #   train.csv  |  val.csv  |  test.csv
 #
-# DVC INTEGRATION:
-#   After saving, files are tracked with `dvc add` and pushed to remote.
-#   The .dvc pointer files are committed to git automatically.
+#DVC INTEGRATION:
+#    Files are saved to data/interim/. DVC tracking is handled externally
+#    via dvc.yaml (not inside this script), but the function track_splits_with_dvc()
+#    is available for optional use in notebooks or manual workflows.
 #
 # Run after : src/data/validation.py
 # Run before: EDA (on train.csv only) → cleaning.py
@@ -24,6 +25,7 @@
 
 from __future__ import annotations
 
+import sys
 import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -33,6 +35,8 @@ from typing import Optional
 import pandas as pd
 import yaml
 from sklearn.model_selection import train_test_split
+from src.data.data_loader import DataLoader
+
 
 from src.utils.logger import get_logger
 from src.utils.paths import (
@@ -532,22 +536,13 @@ def run_splitting(
 # =============================================================================
 
 if __name__ == "__main__":
-    import sys
-    from src.data.data_loader import DataLoader
-    from src.data.validation import validate_dataframe, ValidationError
 
     config = "configs/data_config.yaml"
 
     df = DataLoader().load_raw("housing.csv")
     logger.info(f"Loaded: {df.shape[0]:,} rows × {df.shape[1]} columns")
 
-    try:
-        validate_dataframe(df, config_path=config, raise_on_failure=True)
-    except ValidationError as e:
-        logger.error(f"Validation failed: {e}")
-        sys.exit(1)
-
-    result = run_splitting(df, config_path=config)
+    result = run_splitting(df, config_path=config, auto_track_dvc=False)
     print(result.summary())
     sys.exit(0)
 
