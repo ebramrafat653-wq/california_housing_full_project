@@ -1,0 +1,146 @@
+stages:
+
+  # ============================================================
+  # 1. INGESTION
+  # ============================================================
+  ingestion:
+    cmd: python -m src.data.ingestion --no-dvc
+    deps:
+      - src/data/ingestion.py
+      - src/data/data_loader.py
+      - src/utils/paths.py
+      - configs/data_config.yaml
+    outs:
+      - data/raw/housing.csv
+
+
+  # ============================================================
+  # 2. VALIDATION
+  # ============================================================
+  validation:
+    cmd: python -m src.data.validation
+    deps:
+      - src/data/validation.py
+      - data/raw/housing.csv
+    params:
+      - configs/data_config.yaml:
+          - validation  # 🟢 تم التصحيح من validation_rules إلى validation
+    outs:
+      - reports/validation
+
+
+  # ============================================================
+  # 3. SPLITTING
+  # ============================================================
+  splitting:
+    cmd: python -m src.data.splitting
+    deps:
+      - src/data/splitting.py
+      - data/raw/housing.csv
+    params:
+      - configs/data_config.yaml:
+          - split.val_size
+          - split.test_size
+          - split.random_state
+    outs:
+      - data/interim
+
+
+  # ============================================================
+  # 4. CLEANING
+  # ============================================================
+  cleaning:
+    cmd: python -m src.data.cleaning
+    deps:
+      - src/data/cleaning.py
+      - data/interim
+    params:
+      - configs/data_config.yaml:
+          - eda_derived.missingness
+          - eda_derived.target_summary
+          - eda_derived.lof
+    outs:
+      - data/processed/train_clean.csv
+      - data/processed/val_clean.csv
+      - data/processed/test_clean.csv
+      - artifacts/cleaning_artifacts.json
+      - artifacts/lof_model.pkl
+      - artifacts/lof_scaler.pkl
+
+
+  # ============================================================
+  # 5. FEATURE ENGINEERING
+  # ============================================================
+  engineering:
+    cmd: python -m src.features.engineering
+    deps:
+      - src/features/engineering.py
+      - data/processed/train_clean.csv
+      - data/processed/val_clean.csv
+      - data/processed/test_clean.csv
+    params:
+      - configs/data_config.yaml:
+          - eda_derived.engineered_features
+    outs:
+      - data/processed/train_feat.csv
+      - data/processed/val_feat.csv
+      - data/processed/test_feat.csv
+
+
+  # ============================================================
+  # 6. PREPROCESSING (Pipeline Fitting)
+  # ============================================================
+  preprocessing:
+    cmd: python -m src.features.pipeline
+    deps:
+      - src/features/pipeline.py
+      - data/processed/train_feat.csv  
+    params:
+      - configs/data_config.yaml:
+          - features_config            
+    outs:
+      - artifacts/engineering_artifacts.json
+
+
+  # ============================================================
+  # 7. TRAINING
+  # ============================================================
+  training:
+    cmd: python -m src.models.training
+    deps:
+      - src/models/training.py
+      - data/processed/train_feat.csv
+      - data/processed/val_feat.csv
+      - artifacts/preprocessing_pipeline.pkl
+    params:
+      - configs/model_config.yaml:
+          - model_params
+          - seed
+          - cross_validation
+    outs:
+      - models
+
+
+  # ============================================================
+  # 8. EVALUATION
+  # ============================================================
+  evaluation:
+    cmd: python -m src.models.evaluation
+    deps:
+      - src/models/evaluation.py
+      - models
+      - data/processed/test_feat.csv
+      - artifacts/preprocessing_pipeline.pkl
+    params:
+      - configs/model_config.yaml:
+          - evaluation_metrics
+    metrics:
+      - reports/metrics.json:
+          cache: false
+    plots:
+      - reports/residuals.png:
+          cache: false
+      - reports/feature_importance.png:
+          cache: false
+      - reports/pred_vs_actual.png:
+          cache: false
