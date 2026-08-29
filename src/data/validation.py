@@ -25,6 +25,7 @@
 
 from __future__ import annotations
 
+import sys 
 import yaml
 import pandas as pd
 from pathlib import Path
@@ -357,20 +358,9 @@ def validate_dataframe(
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    import sys
-    import pandas as pd
-    from src.data.ingestion import run_ingestion  # correct function name
 
     config = "configs/data_config.yaml"
 
-    logger.info("Running ingestion before validation...")
-    ingest_report = run_ingestion(config_path=config)
-
-    if not ingest_report.success:
-        logger.error(f"Ingestion failed: {ingest_report.errors}")
-        sys.exit(1)
-
-    # Load the raw data using the centralized DataLoader
     loader = DataLoader()
     df = loader.load_raw("housing.csv")
     logger.info(f"Loaded DataFrame: {df.shape[0]:,} rows × {df.shape[1]} columns")
