@@ -1,548 +1,108 @@
 # =============================================================================
 # src/data/cleaning.py
-# California Housing Project — Data Cleaning (EDA-driven, Phase 1)
+# California Housing Project — Data Cleaning
 #
-# Decisions source: notebooks/03_eda.ipynb → configs/data_config.yaml (eda_derived)
+# RESPONSIBILITY
+# --------------
+# This module is responsible ONLY for:
+#   1. Configuration loading
+#   2. Strict missing-value validation
+#   3. Train-only imputation
+#   4. Train-fitted LOF outlier detection
+#   5. Saving cleaned train/validation/test datasets
+#   6. Saving train-fitted cleaning artifacts
 #
-# WHAT THIS MODULE DOES (in order):
-#   1. Global median imputation on total_bedrooms  (MCAR confirmed, p=0.3095)
-#   2. Add is_capped flag on target                (>= cap_threshold from config)
-#   3. log1p transform on count-based columns      (from config: log1p_columns)
-#   4. median_income: NO transform                 (RobustScaler handled in preprocessing)
-#   5. LOF outlier flag                            (contamination from config)
+# THIS MODULE DOES NOT
+# --------------------
+#   - Perform feature engineering
+#   - Create ratios
+#   - Apply log1p transformations
+#   - Create target-derived features
+#   - Train ML models
+#   - Perform model preprocessing
+#   - Execute DVC commands
+#   - Execute Git commands
 #
-# CONFIG-DRIVEN DESIGN:
-#   All EDA-derived values (log1p columns, cap threshold, LOF contamination/
-#   features) are read from configs/data_config.yaml -> eda_derived section.
-#   This is the SAME file produced by notebooks/03_eda.ipynb's extraction cell.
-#   Re-running EDA and updating the YAML automatically updates this module's
-#   behaviour - no hardcoded constants to keep in sync manually.
+# PIPELINE POSITION
+# -----------------
 #
-#   Module-level constants below are FALLBACK DEFAULTS ONLY, used if the
-#   config file or eda_derived section is missing. A warning is logged
-#   whenever a fallback is used.
+#   data/interim/
+#       train.csv
+#       val.csv
+#       test.csv
+#             |
+#             v
+#        cleaning.py
+#             |
+#             +--> train_clean.csv
+#             +--> val_clean.csv
+#             +--> test_clean.csv
+#             |
+#             +--> artifacts/
+#                   cleaning_artifacts.json
+#                   lof_model.pkl
+#                   lof_scaler.pkl
 #
-# WHAT THIS MODULE DOES NOT DO:
-#   - Feature engineering  -> feature_engineering.py
-#   - Scaling/encoding     -> preprocessing.py
-#   - Dropping raw columns -> feature_engineering.py (after ratio creation)
+# LEAKAGE POLICY
+# --------------
+# All learned statistics/models are fitted on TRAIN ONLY.
 #
-# FIT/TRANSFORM RULE (prevents data leakage):
-#   All statistics (median, LOF) are fit on TRAIN only.
-#   Val and test are transformed using train-derived values.
+#   TRAIN
+#      |
+#      +--> fit imputer
+#      +--> fit scaler
+#      +--> fit LOF
+#      |
+#      +--> transform TRAIN
+#      +--> transform VALIDATION
+#      +--> transform TEST
 #
-# INPUT  : data/interim/train.csv | val.csv | test.csv
-# OUTPUT : data/processed/train_clean.csv | val_clean.csv | test_clean.csv
-#          + artifacts/cleaning_artifacts.json  (train-fit statistics)
+# DVC
+# ---
+# DVC is intentionally NOT used inside this module.
+# DVC orchestration belongs to dvc.yaml / pipeline orchestration.
 #
-# DVC: output directory is tracked as data/processed/
 # =============================================================================
 
 from __future__ import annotations
 
 import json
-import subprocess
+import pickle
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 import pandas as pd
 import yaml
 from sklearn.neighbors import LocalOutlierFactor
+from sklearn.preprocessing import StandardScaler
 
 from src.utils.logger import get_logger
-from src.utils.paths import (
-    PROJECT_DIR,
-    DVC_REMOTE_NAME,
-    is_dvc_initialized,
-    ensure_path,
-    configure_git_identity,
-)
+from src.utils.paths import PROJECT_DIR, ensure_path
+
 
 logger = get_logger(__name__)
 
-# -- Fallback defaults - used ONLY if data_config.yaml is missing eda_derived --
-# These mirror the last known EDA run, but config.yaml is the source of truth.
-_FALLBACK_LOG1P_COLS: list[str] = [
-    "total_rooms", "total_bedrooms", "population", "households",
-]
-_FALLBACK_CAP_THRESHOLD: float = 500_001.0
-_FALLBACK_LOF_CONTAMINATION: float = 0.02
-_FALLBACK_LOF_N_NEIGHBORS: int = 20
-_FALLBACK_LOF_FEATURES: list[str] = [
-    "median_income", "total_rooms", "population",
-    "households", "longitude", "latitude",
-]
-_TARGET: str = "median_house_value"
-
 
 # =============================================================================
-# CONFIG LOADER - reads eda_derived section from data_config.yaml
+# CONSTANTS
 # =============================================================================
 
-@dataclass
-class EdaConfig:
-    """
-    Typed container for EDA-derived cleaning parameters.
+_TARGET = "median_house_value"
 
-    Populated from configs/data_config.yaml -> eda_derived section.
-    Falls back to module-level defaults (with a warning) if any key is missing.
-    """
-    log1p_columns: list[str]
-    cap_threshold: float
-    lof_contamination: float
-    lof_n_neighbors: int
-    lof_features: list[str]
-    imputation_strategy: str = "global_median"
-    source: str = "config"   # "config" or "fallback" - for traceability
+_DEFAULT_CONFIG_PATH = "configs/data_config.yaml"
 
+_CLEANED_TRAIN_FILENAME = "train_clean.csv"
+_CLEANED_VAL_FILENAME = "val_clean.csv"
+_CLEANED_TEST_FILENAME = "test_clean.csv"
 
-def load_eda_config(config_path: str | Path = "configs/data_config.yaml") -> EdaConfig:
-    """
-    Load EDA-derived cleaning parameters from data_config.yaml.
+_ARTIFACTS_DIRNAME = "artifacts"
 
-    Reads the `eda_derived` section produced by notebooks/03_eda.ipynb's
-    extraction cell. If the file or section is missing, falls back to
-    last-known-good defaults and logs a warning - the pipeline still runs,
-    but you should re-run EDA and update the config.
-
-    Returns
-    -------
-    EdaConfig with all parameters needed by the cleaning steps below.
-    """
-    config_path = Path(config_path)
-
-    if not config_path.exists():
-        logger.warning(
-            f"Config not found: {config_path} - using fallback EDA defaults. "
-            "Run notebooks/03_eda.ipynb and save data_config.yaml for accurate values."
-        )
-        return EdaConfig(
-            log1p_columns=_FALLBACK_LOG1P_COLS,
-            cap_threshold=_FALLBACK_CAP_THRESHOLD,
-            lof_contamination=_FALLBACK_LOF_CONTAMINATION,
-            lof_n_neighbors=_FALLBACK_LOF_N_NEIGHBORS,
-            lof_features=_FALLBACK_LOF_FEATURES,
-            source="fallback",
-        )
-
-    with open(config_path, "r", encoding="utf-8") as f:
-        cfg = yaml.safe_load(f)
-
-    eda = cfg.get("eda_derived")
-    if not eda:
-        logger.warning(
-            f"'{config_path}' has no 'eda_derived' section - using fallback defaults. "
-            "Run notebooks/03_eda.ipynb's extraction cell and update the YAML."
-        )
-        return EdaConfig(
-            log1p_columns=_FALLBACK_LOG1P_COLS,
-            cap_threshold=_FALLBACK_CAP_THRESHOLD,
-            lof_contamination=_FALLBACK_LOF_CONTAMINATION,
-            lof_n_neighbors=_FALLBACK_LOF_N_NEIGHBORS,
-            lof_features=_FALLBACK_LOF_FEATURES,
-            source="fallback",
-        )
-
-    log1p_cols   = eda.get("log1p_columns", _FALLBACK_LOG1P_COLS)
-    cap_thresh   = eda.get("target_summary", {}).get("cap_threshold", _FALLBACK_CAP_THRESHOLD)
-    lof_cfg      = eda.get("lof", {})
-    contamination = lof_cfg.get("contamination", _FALLBACK_LOF_CONTAMINATION)
-    n_neighbors    = lof_cfg.get("n_neighbors", _FALLBACK_LOF_N_NEIGHBORS)
-    lof_features   = lof_cfg.get("features", _FALLBACK_LOF_FEATURES)
-    imputation_strategy = (
-        eda.get("missingness", {})
-           .get("total_bedrooms", {})
-           .get("imputation_strategy", "global_median")
-    )
-
-    logger.info(
-        f"EDA config loaded: log1p_cols={log1p_cols}, "
-        f"cap_threshold={cap_thresh}, lof_contamination={contamination}"
-    )
-
-    return EdaConfig(
-        log1p_columns=log1p_cols,
-        cap_threshold=float(cap_thresh),
-        lof_contamination=float(contamination),
-        lof_n_neighbors=int(n_neighbors),
-        lof_features=lof_features,
-        imputation_strategy=imputation_strategy,
-        source="config",
-    )
-
-
-# =============================================================================
-# RESULT DATACLASS
-# =============================================================================
-
-@dataclass
-class CleaningResult:
-    """Holds cleaned DataFrames, artifacts, and a run summary."""
-
-    train: pd.DataFrame
-    val:   pd.DataFrame
-    test:  pd.DataFrame
-
-    train_path: Optional[Path] = None
-    val_path:   Optional[Path] = None
-    test_path:  Optional[Path] = None
-
-    # Train-fit statistics (serialised to artifacts/cleaning_artifacts.json)
-    imputation_median: Optional[float] = None
-    lof_n_outliers_train: int = 0
-    eda_config_source: str = "config"   # "config" or "fallback" - traceability
-
-    timestamp:   datetime = field(default_factory=datetime.now)
-    dvc_tracked: bool = False
-    warnings:    list[str] = field(default_factory=list)
-
-    def summary(self) -> str:
-        lines = [
-            "=" * 60,
-            "  CLEANING RESULT SUMMARY",
-            "=" * 60,
-            f"  Train : {len(self.train):,} rows x {self.train.shape[1]} cols",
-            f"  Val   : {len(self.val):,} rows x {self.val.shape[1]} cols",
-            f"  Test  : {len(self.test):,} rows x {self.test.shape[1]} cols",
-            "",
-            f"  EDA config source             : {self.eda_config_source}",
-            f"  total_bedrooms median (train) : {self.imputation_median}",
-            f"  LOF outliers flagged (train)  : {self.lof_n_outliers_train}",
-            f"  DVC tracked                   : {'yes' if self.dvc_tracked else 'no'}",
-        ]
-        if self.eda_config_source == "fallback":
-            lines.append(
-                "  WARNING: using fallback EDA defaults, not data_config.yaml!"
-            )
-        if self.train_path:
-            lines += [
-                "",
-                "  Saved to:",
-                f"    train -> {self.train_path}",
-                f"    val   -> {self.val_path}",
-                f"    test  -> {self.test_path}",
-            ]
-        if self.warnings:
-            lines.append("\n  Warnings:")
-            for w in self.warnings:
-                lines.append(f"    !  {w}")
-        lines.append("=" * 60)
-        return "\n".join(lines)
-
-
-# =============================================================================
-# STEP 1 - IMPUTATION
-# =============================================================================
-
-def fit_imputer(train: pd.DataFrame) -> dict[str, float]:
-    """
-    Compute train-only imputation statistics.
-
-    Returns a dict mapping column -> fill value.
-    Only columns with actual nulls are included.
-
-    Strategy is global median/mode regardless of MCAR/MAR - grouped
-    imputation (e.g. by ocean_proximity) is not yet implemented even if
-    eda_config.imputation_strategy says otherwise. See module docstring.
-    """
-    stats: dict[str, float] = {}
-    null_cols = [c for c in train.columns if train[c].isnull().any()]
-
-    for col in null_cols:
-        if pd.api.types.is_numeric_dtype(train[col]):
-            median_val = train[col].median()
-            stats[col] = float(median_val)
-            logger.info(f"Imputer fit: '{col}' -> median = {median_val:.4f}")
-        else:
-            mode_val = train[col].mode()[0]
-            stats[col] = mode_val
-            logger.info(f"Imputer fit: '{col}' -> mode = {mode_val}")
-
-    return stats
-
-
-def apply_imputer(df: pd.DataFrame, imputer_stats: dict[str, float]) -> pd.DataFrame:
-    """Apply train-fit imputation to any split (train / val / test)."""
-    df = df.copy()
-    for col, fill_val in imputer_stats.items():
-        if col not in df.columns:
-            logger.warning(f"Imputer: column '{col}' not found in DataFrame - skipping.")
-            continue
-        n_filled = df[col].isnull().sum()
-        if n_filled > 0:
-            df[col] = df[col].fillna(fill_val)
-            logger.info(f"Imputed '{col}': filled {n_filled} nulls with {fill_val}")
-    return df
-
-
-# =============================================================================
-# STEP 2 - TARGET FLAG
-# =============================================================================
-
-def add_is_capped_flag(
-    df: pd.DataFrame,
-    cap_threshold: float = _FALLBACK_CAP_THRESHOLD,
-    target: str = _TARGET,
-) -> pd.DataFrame:
-    """
-    Add binary `is_capped` column (1 if target >= cap_threshold).
-
-    cap_threshold should come from EdaConfig.cap_threshold (data_config.yaml
-    -> eda_derived.target_summary.cap_threshold), not the fallback default.
-
-    Reason: capped rows are NOT errors - they are real districts whose
-    value exceeds the survey ceiling. Flagging lets models treat them
-    differently without removing them.
-    """
-    df = df.copy()
-    if target not in df.columns:
-        logger.warning(f"Target column '{target}' not found - is_capped flag skipped.")
-        return df
-    df["is_capped"] = (df[target] >= cap_threshold).astype(int)
-    n_capped = df["is_capped"].sum()
-    logger.info(
-        f"is_capped flag added (threshold={cap_threshold}): "
-        f"{n_capped:,} rows ({n_capped/len(df):.2%})"
-    )
-    return df
-
-
-# =============================================================================
-# STEP 3 - LOG1P TRANSFORM
-# =============================================================================
-
-def apply_log1p(
-    df: pd.DataFrame,
-    cols: list[str] = _FALLBACK_LOG1P_COLS,
-) -> pd.DataFrame:
-    """
-    Apply log1p to count-based columns.
-
-    `cols` should come from EdaConfig.log1p_columns (data_config.yaml ->
-    eda_derived.log1p_columns), not the fallback default.
-
-    NOT transformed: median_income - not a count variable. RobustScaler
-    handles this in preprocessing.py for linear models; tree models need
-    no transformation at all.
-
-    log1p is used instead of log to safely handle any zero values.
-    """
-    df = df.copy()
-    for col in cols:
-        if col not in df.columns:
-            logger.warning(f"log1p: column '{col}' not found - skipping.")
-            continue
-        if (df[col] < 0).any():
-            logger.warning(
-                f"log1p: '{col}' has negative values - skipping to avoid NaN."
-            )
-            continue
-        before_skew = df[col].skew()
-        df[col] = np.log1p(df[col])
-        after_skew = df[col].skew()
-        logger.info(
-            f"log1p '{col}': skew {before_skew:.3f} -> {after_skew:.3f}"
-        )
-    return df
-
-
-# =============================================================================
-# STEP 4 - LOF OUTLIER FLAG
-# =============================================================================
-
-def fit_lof(
-    train: pd.DataFrame,
-    features: list[str] = _FALLBACK_LOF_FEATURES,
-    contamination: float = _FALLBACK_LOF_CONTAMINATION,
-    n_neighbors: int = _FALLBACK_LOF_N_NEIGHBORS,
-) -> tuple[Optional[LocalOutlierFactor], list[str]]:
-    """
-    Fit LOF on train set and return (fitted_lof, used_features).
-
-    `features`, `contamination`, and `n_neighbors` should come from
-    EdaConfig (data_config.yaml -> eda_derived.lof), not the fallback
-    defaults - those are last-resort values only.
-
-    LOF is fit-only on train; for val/test we use .predict() (novelty=True).
-
-    Returns (None, available) if there aren't enough rows to fit
-    (len(lof_data) <= n_neighbors) - caller must handle None.
-    """
-    available = [c for c in features if c in train.columns]
-    missing   = set(features) - set(available)
-    if missing:
-        logger.warning(f"LOF: features not found and skipped: {missing}")
-
-    lof_data = train[available].dropna()
-
-    # Guard: LOF requires at least n_neighbors + 1 rows to fit
-    if len(lof_data) <= n_neighbors:
-        logger.warning(
-            f"LOF skipped: only {len(lof_data)} rows available after dropna, "
-            f"need > n_neighbors={n_neighbors}. "
-            "lof_outlier column will be set to -99 (unknown) for all rows."
-        )
-        return None, available   # caller checks for None
-
-    lof = LocalOutlierFactor(
-        n_neighbors=n_neighbors,
-        contamination=contamination,
-        novelty=True,          # novelty=True allows predict on new data
-    )
-    lof.fit(lof_data)
-    logger.info(
-        f"LOF fit on {len(lof_data):,} train rows | "
-        f"features={available} | contamination={contamination} | "
-        f"n_neighbors={n_neighbors}"
-    )
-    return lof, available
-
-
-def apply_lof_flag(
-    df: pd.DataFrame,
-    lof: Optional[LocalOutlierFactor],
-    features: list[str],
-) -> pd.DataFrame:
-    """
-    Add `lof_outlier` flag (1 = outlier) using a train-fit LOF model.
-
-    Rows with nulls in LOF features are flagged as -99 (unknown).
-    If lof is None (skipped due to insufficient rows), all rows get -99.
-    """
-    df = df.copy()
-
-    if lof is None:
-        df["lof_outlier"] = -99
-        logger.warning("LOF model is None - all rows flagged as -99 (unknown).")
-        return df
-
-    lof_data = df[features].dropna()
-
-    predictions = lof.predict(lof_data)          # -1 = outlier, +1 = inlier
-    flag_series = pd.Series(
-        (predictions == -1).astype(int),
-        index=lof_data.index,
-    )
-
-    df["lof_outlier"] = -99                       # default: unknown (null rows)
-    df.loc[flag_series.index, "lof_outlier"] = flag_series
-
-    n_outliers = (df["lof_outlier"] == 1).sum()
-    n_unknown  = (df["lof_outlier"] == -99).sum()
-    logger.info(
-        f"LOF flag applied: {n_outliers} outliers, {n_unknown} unknown (nulls in features)"
-    )
-    return df
-
-
-# =============================================================================
-# ARTIFACTS - save/load train-fit statistics
-# =============================================================================
-
-def save_artifacts(
-    imputer_stats: dict,
-    lof: Optional[LocalOutlierFactor],
-    lof_features: list[str],
-    eda_config: EdaConfig,
-    output_dir: Optional[Path] = None,
-) -> Path:
-    """
-    Persist train-fit statistics to artifacts/cleaning_artifacts.json.
-
-    These are needed to apply the same transformations to val/test and
-    to new production data without re-fitting. Includes the EdaConfig
-    values actually used for this run (for full reproducibility).
-    """
-    import pickle
-
-    artifacts_dir = output_dir or (PROJECT_DIR / "artifacts")
-    artifacts_dir.mkdir(parents=True, exist_ok=True)
-
-    # Save LOF model as pickle (may be None if LOF was skipped)
-    lof_path = artifacts_dir / "lof_model.pkl"
-    with open(lof_path, "wb") as f:
-        pickle.dump(lof, f)
-
-    # Save JSON-serialisable stats - uses the EdaConfig actually used this run
-    meta = {
-        "imputer_stats": imputer_stats,
-        "lof_features":  lof_features,
-        "lof_contamination": eda_config.lof_contamination,
-        "lof_n_neighbors": eda_config.lof_n_neighbors,
-        "log1p_cols":    eda_config.log1p_columns,
-        "cap_threshold": eda_config.cap_threshold,
-        "eda_config_source": eda_config.source,
-        "timestamp":     datetime.now().isoformat(),
-    }
-    meta_path = artifacts_dir / "cleaning_artifacts.json"
-    with open(meta_path, "w", encoding="utf-8") as f:
-        json.dump(meta, f, indent=2)
-
-    logger.info(f"Artifacts saved -> {artifacts_dir}")
-    return meta_path
-
-
-def load_artifacts(artifacts_dir: Optional[Path] = None) -> tuple[dict, LocalOutlierFactor, list[str]]:
-    """
-    Load train-fit statistics from artifacts/.
-
-    Returns (imputer_stats, lof_model, lof_features).
-    """
-    import pickle
-
-    artifacts_dir = artifacts_dir or (PROJECT_DIR / "artifacts")
-    meta_path = artifacts_dir / "cleaning_artifacts.json"
-    lof_path  = artifacts_dir / "lof_model.pkl"
-
-    if not meta_path.exists():
-        raise FileNotFoundError(f"Cleaning artifacts not found: {meta_path}")
-    if not lof_path.exists():
-        raise FileNotFoundError(f"LOF model artifact not found: {lof_path}")
-
-    with open(meta_path, "r", encoding="utf-8") as f:
-        meta = json.load(f)
-
-    with open(lof_path, "rb") as f:
-        lof = pickle.load(f)
-
-    logger.info(f"Artifacts loaded from {artifacts_dir}")
-    return meta["imputer_stats"], lof, meta["lof_features"]
-
-
-# =============================================================================
-# SAVE TO DISK (data/processed/)
-# =============================================================================
-
-def save_cleaned_splits(
-    result: CleaningResult,
-    output_dir: Optional[Path] = None,
-) -> CleaningResult:
-    """Save cleaned CSVs to data/processed/."""
-    out = output_dir or ensure_path("processed")
-    out.mkdir(parents=True, exist_ok=True)
-
-    paths = {
-        "train": out / "train_clean.csv",
-        "val":   out / "val_clean.csv",
-        "test":  out / "test_clean.csv",
-    }
-
-    result.train.to_csv(paths["train"], index=False)
-    result.val.to_csv(paths["val"],   index=False)
-    result.test.to_csv(paths["test"], index=False)
-
-    result.train_path = paths["train"]
-    result.val_path   = paths["val"]
-    result.test_path  = paths["test"]
-
-    for name, path in paths.items():
-        size_mb = path.stat().st_size / (1024 * 1024)
-        logger.info(f"Saved {name}_clean.csv -> {path} ({size_mb:.2f} MB)")
-
-    return result
+_IMPUTER_ARTIFACT_FILENAME = "cleaning_artifacts.json"
+_LOF_MODEL_FILENAME = "lof_model.pkl"
+_LOF_SCALER_FILENAME = "lof_scaler.pkl"
 
 
 # =============================================================================
@@ -550,319 +110,1504 @@ def save_cleaned_splits(
 # =============================================================================
 
 class CleaningError(Exception):
-    """Raised on unrecoverable cleaning failures (e.g. critical DVC steps)."""
+    """Raised when the cleaning pipeline cannot safely continue."""
+
     pass
 
 
 # =============================================================================
-# DVC TRACKING
+# CONFIGURATION
 # =============================================================================
 
-def _run_cmd(
-    cmd: list[str],
-    cwd: Path,
-    timeout: int = 120,
-    raise_on_failure: bool = False,
-) -> bool:
+@dataclass
+class EdaConfig:
     """
-    Run a subprocess command.
+    Typed representation of the EDA-derived configuration required by cleaning.
+
+    Expected source:
+
+        configs/data_config.yaml
+
+    Relevant section:
+
+        eda_derived:
+            missingness:
+                ...
+            lof:
+                ...
+            target_summary:
+                ...
+
+    Notes
+    -----
+    log1p configuration is intentionally NOT loaded here.
+
+    log1p belongs to feature engineering and therefore must not be handled
+    by cleaning.py.
+    """
+
+    impute_columns: list[str]
+
+    imputation_strategy: dict[str, str]
+
+    cap_threshold: float
+
+    lof_contamination: float
+
+    lof_n_neighbors: int
+
+    lof_features: list[str]
+
+
+def load_eda_config(
+    config_path: str | Path = _DEFAULT_CONFIG_PATH,
+) -> EdaConfig:
+    """
+    Load and validate EDA-derived configuration.
+
+    The function intentionally fails fast if the required configuration
+    is missing or malformed.
 
     Parameters
     ----------
-    raise_on_failure : If True, raises CleaningError on non-zero return code.
-                       Use for critical steps (dvc add) where silent failure
-                       would leave the pipeline in an inconsistent state.
-                       False (default) for best-effort steps (dvc push, git push).
-    """
-    try:
-        r = subprocess.run(
-            cmd, cwd=cwd, capture_output=True,
-            text=True, errors="replace", timeout=timeout,
-        )
-    except subprocess.TimeoutExpired:
-        msg = f"Command timed out after {timeout}s: {' '.join(cmd)}"
-        logger.error(msg)
-        if raise_on_failure:
-            raise CleaningError(msg)
-        return False
-    except Exception as e:
-        msg = f"Command raised unexpected error: {' '.join(cmd)} - {e}"
-        logger.error(msg)
-        if raise_on_failure:
-            raise CleaningError(msg)
-        return False
-
-    if r.returncode != 0:
-        msg = f"Command failed: {' '.join(cmd)}\n  stderr: {r.stderr.strip()}"
-        if raise_on_failure:
-            logger.error(msg)
-            raise CleaningError(msg)
-        logger.warning(msg)
-        return False
-
-    return True
-
-
-def track_processed_with_dvc(
-    result: CleaningResult,
-    remote_name: str = DVC_REMOTE_NAME,
-    timeout: int = 300,
-) -> bool:
-    """Track data/processed/ with DVC and push to remote."""
-    if not is_dvc_initialized():
-        logger.warning("DVC not initialized - skipping tracking.")
-        return False
-
-    if not result.train_path:
-        logger.warning("No paths in CleaningResult - call save_cleaned_splits() first.")
-        return False
-
-    processed_dir = result.train_path.parent
-    try:
-        rel = processed_dir.relative_to(PROJECT_DIR)
-    except ValueError:
-        logger.error(f"{processed_dir} is outside PROJECT_DIR.")
-        return False
-
-    # dvc add is CRITICAL - if it fails the pointer file won't exist
-    logger.info(f"DVC add: {rel}")
-    _run_cmd(
-        ["dvc", "add", str(rel)],
-        cwd=PROJECT_DIR,
-        timeout=timeout,
-        raise_on_failure=True,   # raises CleaningError on failure
-    )
-
-    # dvc push is best-effort - data is saved locally even if remote push fails
-    logger.info(f"DVC push -> {remote_name}")
-    push_ok = _run_cmd(
-        ["dvc", "push", f"--remote={remote_name}", str(rel)],
-        cwd=PROJECT_DIR,
-        timeout=timeout,
-        raise_on_failure=False,
-    )
-    if not push_ok:
-        logger.warning(
-            "DVC push failed - data saved locally but NOT on remote. "
-            "Run `dvc push` manually when the remote is available."
-        )
-        result.warnings.append("DVC push failed - run `dvc push` manually.")
-
-    configure_git_identity(PROJECT_DIR)
-    gitignore = rel.parent / ".gitignore"
-    _run_cmd(
-        ["git", "add", f"{rel}.dvc", str(gitignore)],
-        cwd=PROJECT_DIR,
-        timeout=30,
-        raise_on_failure=False,
-    )
-
-    status = subprocess.run(
-        ["git", "status", "--porcelain"],
-        cwd=PROJECT_DIR, capture_output=True,
-        text=True, errors="replace", timeout=15,
-    )
-    if not status.stdout.strip():
-        logger.info("No new git changes - processed already tracked.")
-        result.dvc_tracked = True
-        return True
-
-    _run_cmd(
-        ["git", "commit", "-m", "data: track processed cleaned splits with DVC"],
-        cwd=PROJECT_DIR,
-        timeout=60,
-        raise_on_failure=False,
-    )
-    ok = _run_cmd(
-        ["git", "push"],
-        cwd=PROJECT_DIR,
-        timeout=120,
-        raise_on_failure=False,
-    )
-    if ok:
-        logger.info("Processed splits tracked and pushed to DVC remote.")
-        result.dvc_tracked = True
-    else:
-        logger.error(
-            "git push failed - .dvc pointer committed locally but not on GitHub. "
-            "Run `git push` manually."
-        )
-        result.warnings.append("git push failed - run `git push` manually.")
-    return ok
-
-
-# =============================================================================
-# MAIN PIPELINE ENTRY POINT
-# =============================================================================
-
-def run_cleaning(
-    train: pd.DataFrame,
-    val:   pd.DataFrame,
-    test:  pd.DataFrame,
-    config_path: str | Path = "configs/data_config.yaml",
-    output_dir: Optional[Path] = None,
-    auto_track_dvc: bool = True,
-    save_artifacts_flag: bool = True,
-) -> CleaningResult:
-    """
-    Full cleaning pipeline: impute -> flag -> transform -> LOF -> save -> DVC.
-
-    All EDA-derived parameters (log1p columns, cap threshold, LOF settings)
-    are loaded from `config_path` -> eda_derived section. If that section is
-    missing, fallback defaults are used and CleaningResult.eda_config_source
-    will read "fallback" - check this before trusting the output.
-
-    FIT/TRANSFORM RULE:
-        All statistics are computed on `train` only.
-        The same fitted objects are applied to `val` and `test`.
-
-    Parameters
-    ----------
-    train / val / test  : Split DataFrames from splitting.py
-    config_path         : Path to data_config.yaml (must contain eda_derived)
-    output_dir          : Override for data/processed/
-    auto_track_dvc      : Track output with DVC after saving
-    save_artifacts_flag : Persist train-fit stats to artifacts/
+    config_path:
+        Path to configs/data_config.yaml.
 
     Returns
     -------
-    CleaningResult with all three cleaned DataFrames and file paths.
+    EdaConfig
 
-    Usage
-    -----
-        from src.data.data_loader import DataLoader
-        from src.data.cleaning import run_cleaning
+    Raises
+    ------
+    FileNotFoundError
+        If the configuration file does not exist.
 
-        loader = DataLoader()
-        train  = loader.load_interim("train.csv")
-        val    = loader.load_interim("val.csv")
-        test   = loader.load_interim("test.csv")
-
-        result = run_cleaning(train, val, test)
-        train_clean = result.train
+    CleaningError
+        If the configuration is malformed or contains invalid values.
     """
-    logger.info("=" * 60)
-    logger.info("  Data cleaning started")
-    logger.info("=" * 60)
 
-    # -- Input guards ----------------------------------------------------------
-    for name, df in [("train", train), ("val", val), ("test", test)]:
-        if df.empty:
-            raise CleaningError(f"Input '{name}' DataFrame is empty - cannot clean.")
-    if _TARGET not in train.columns:
+    config_path = Path(config_path)
+
+    # -------------------------------------------------------------------------
+    # Config file must exist
+    # -------------------------------------------------------------------------
+
+    if not config_path.exists():
+        raise FileNotFoundError(
+            f"Config file not found: {config_path}. "
+            "Cleaning cannot continue without a valid data configuration."
+        )
+
+    # -------------------------------------------------------------------------
+    # Load YAML
+    # -------------------------------------------------------------------------
+
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f)
+    except yaml.YAMLError as exc:
         raise CleaningError(
-            f"Target column '{_TARGET}' not found in train. "
-            "Ensure splitting.py ran successfully before cleaning."
+            f"Failed to parse YAML config: {config_path}"
+        ) from exc
+
+    if not isinstance(cfg, dict):
+        raise CleaningError(
+            f"Invalid configuration format in {config_path}. "
+            "Expected a YAML mapping."
         )
 
-    # -- Load EDA-derived config (single source of truth) --------------------
-    eda_config = load_eda_config(config_path)
-    if eda_config.source == "fallback":
-        logger.warning(
-            "Cleaning is running with FALLBACK EDA defaults, not data_config.yaml. "
-            "Results may not reflect the latest EDA findings."
+    # -------------------------------------------------------------------------
+    # eda_derived is mandatory
+    # -------------------------------------------------------------------------
+
+    eda = cfg.get("eda_derived")
+
+    if not isinstance(eda, dict):
+        raise CleaningError(
+            f"'eda_derived' section is missing or invalid in {config_path}."
         )
 
-    # -- Step 1: Imputation ------------------------------------------------------
-    logger.info("Step 1/4 - Imputation")
-    imputer_stats = fit_imputer(train)
-    train = apply_imputer(train, imputer_stats)
-    val   = apply_imputer(val,   imputer_stats)
-    test  = apply_imputer(test,  imputer_stats)
+    # -------------------------------------------------------------------------
+    # Missingness configuration
+    # -------------------------------------------------------------------------
 
-    # -- Step 2: is_capped flag --------------------------------------------------
-    logger.info("Step 2/4 - is_capped flag")
-    train = add_is_capped_flag(train, cap_threshold=eda_config.cap_threshold)
-    val   = add_is_capped_flag(val,   cap_threshold=eda_config.cap_threshold)
-    test  = add_is_capped_flag(test,  cap_threshold=eda_config.cap_threshold)
+    missingness = eda.get("missingness")
 
-    # -- Step 3: log1p transform ---------------------------------------------------
-    logger.info("Step 3/4 - log1p transform (count columns only)")
-    train = apply_log1p(train, cols=eda_config.log1p_columns)
-    val   = apply_log1p(val,   cols=eda_config.log1p_columns)
-    test  = apply_log1p(test,  cols=eda_config.log1p_columns)
+    if not isinstance(missingness, dict):
+        raise CleaningError(
+            f"'eda_derived.missingness' is missing or invalid in {config_path}."
+        )
 
-    # -- Step 4: LOF outlier flag ----------------------------------------------------
-    logger.info("Step 4/4 - LOF outlier flag (fit on train)")
-    lof_model, lof_features_used = fit_lof(
+    impute_columns: list[str] = []
+    imputation_strategy: dict[str, str] = {}
+
+    for column, column_config in missingness.items():
+
+        if not isinstance(column_config, dict):
+            raise CleaningError(
+                f"Invalid missingness configuration for column '{column}'."
+            )
+
+        # Explicit opt-in.
+        #
+        # Example:
+        #
+        # total_bedrooms:
+        #     impute: true
+        #     imputation_strategy: median
+        #
+        should_impute = column_config.get("impute", False)
+
+        if should_impute:
+            impute_columns.append(column)
+
+            strategy = column_config.get(
+                "imputation_strategy",
+                "median",
+            )
+
+            if not isinstance(strategy, str):
+                raise CleaningError(
+                    f"Invalid imputation strategy for '{column}'."
+                )
+
+            imputation_strategy[column] = strategy
+
+    # -------------------------------------------------------------------------
+    # Target summary / cap threshold
+    #
+    # NOTE:
+    # cap_threshold is retained as configuration metadata if it is needed
+    # elsewhere in the project.
+    #
+    # It is NOT used to create is_capped here.
+    # -------------------------------------------------------------------------
+
+    target_summary = eda.get("target_summary")
+
+    if not isinstance(target_summary, dict):
+        raise CleaningError(
+            f"'eda_derived.target_summary' is missing or invalid."
+        )
+
+    if "cap_threshold" not in target_summary:
+        raise CleaningError(
+            "'eda_derived.target_summary.cap_threshold' is missing."
+        )
+
+    try:
+        cap_threshold = float(target_summary["cap_threshold"])
+    except (TypeError, ValueError) as exc:
+        raise CleaningError(
+            "cap_threshold must be numeric."
+        ) from exc
+
+    # -------------------------------------------------------------------------
+    # LOF configuration
+    # -------------------------------------------------------------------------
+
+    lof_cfg = eda.get("lof")
+
+    if not isinstance(lof_cfg, dict):
+        raise CleaningError(
+            "'eda_derived.lof' is missing or invalid."
+        )
+
+    required_lof_keys = {
+        "contamination",
+        "n_neighbors",
+        "features",
+    }
+
+    missing_lof_keys = required_lof_keys - set(lof_cfg.keys())
+
+    if missing_lof_keys:
+        raise CleaningError(
+            "Missing required LOF configuration keys: "
+            f"{sorted(missing_lof_keys)}"
+        )
+
+    # contamination
+
+    try:
+        lof_contamination = float(lof_cfg["contamination"])
+    except (TypeError, ValueError) as exc:
+        raise CleaningError(
+            "LOF contamination must be numeric."
+        ) from exc
+
+    if not 0 < lof_contamination < 0.5:
+        raise CleaningError(
+            "LOF contamination must be between 0 and 0.5."
+        )
+
+    # n_neighbors
+
+    try:
+        lof_n_neighbors = int(lof_cfg["n_neighbors"])
+    except (TypeError, ValueError) as exc:
+        raise CleaningError(
+            "LOF n_neighbors must be an integer."
+        ) from exc
+
+    if lof_n_neighbors < 2:
+        raise CleaningError(
+            "LOF n_neighbors must be >= 2."
+        )
+
+    # features
+
+    lof_features = lof_cfg["features"]
+
+    if not isinstance(lof_features, list) or not lof_features:
+        raise CleaningError(
+            "LOF features must be a non-empty list."
+        )
+
+    if not all(isinstance(col, str) for col in lof_features):
+        raise CleaningError(
+            "All LOF feature names must be strings."
+        )
+
+    logger.info(
+        "EDA configuration loaded successfully."
+    )
+
+    logger.info(
+        f"Imputation columns: {impute_columns}"
+    )
+
+    logger.info(
+        f"LOF features: {lof_features}"
+    )
+
+    logger.info(
+        f"LOF contamination: {lof_contamination}"
+    )
+
+    logger.info(
+        f"LOF n_neighbors: {lof_n_neighbors}"
+    )
+
+    return EdaConfig(
+        impute_columns=impute_columns,
+        imputation_strategy=imputation_strategy,
+        cap_threshold=cap_threshold,
+        lof_contamination=lof_contamination,
+        lof_n_neighbors=lof_n_neighbors,
+        lof_features=lof_features,
+    )
+
+
+# =============================================================================
+# RESULT OBJECT
+# =============================================================================
+
+@dataclass
+class CleaningResult:
+    """
+    Result returned by the cleaning pipeline.
+    """
+
+    train: pd.DataFrame
+    val: pd.DataFrame
+    test: pd.DataFrame
+
+    train_path: Optional[Path] = None
+    val_path: Optional[Path] = None
+    test_path: Optional[Path] = None
+
+    imputation_statistics: dict[str, Any] = field(
+        default_factory=dict
+    )
+
+    lof_n_outliers_train: int = 0
+
+    timestamp: datetime = field(
+        default_factory=datetime.now
+    )
+
+    warnings: list[str] = field(
+        default_factory=list
+    )
+
+    def summary(self) -> str:
+        """
+        Return a human-readable cleaning summary.
+        """
+
+        lines = [
+            "=" * 70,
+            "  DATA CLEANING RESULT",
+            "=" * 70,
+            "",
+            f"  Train : {len(self.train):,} rows x {self.train.shape[1]} cols",
+            f"  Val   : {len(self.val):,} rows x {self.val.shape[1]} cols",
+            f"  Test  : {len(self.test):,} rows x {self.test.shape[1]} cols",
+            "",
+            "  Imputation statistics:",
+        ]
+
+        if self.imputation_statistics:
+            for column, value in self.imputation_statistics.items():
+                lines.append(
+                    f"    {column}: {value}"
+                )
+        else:
+            lines.append(
+                "    None"
+            )
+
+        lines.extend(
+            [
+                "",
+                f"  LOF outliers flagged (train): "
+                f"{self.lof_n_outliers_train:,}",
+                "",
+                "  Feature engineering: DEFERRED",
+                "  DVC tracking: HANDLED OUTSIDE CLEANING",
+                "  Git operations: HANDLED OUTSIDE CLEANING",
+            ]
+        )
+
+        if self.train_path:
+            lines.extend(
+                [
+                    "",
+                    "  Saved outputs:",
+                    f"    train -> {self.train_path}",
+                    f"    val   -> {self.val_path}",
+                    f"    test  -> {self.test_path}",
+                ]
+            )
+
+        if self.warnings:
+            lines.append("")
+            lines.append("  Warnings:")
+
+            for warning in self.warnings:
+                lines.append(
+                    f"    ! {warning}"
+                )
+
+        lines.append("=" * 70)
+
+        return "\n".join(lines)
+
+
+# =============================================================================
+# INPUT VALIDATION
+# =============================================================================
+
+def validate_cleaning_inputs(
+    train: pd.DataFrame,
+    val: pd.DataFrame,
+    test: pd.DataFrame,
+) -> None:
+    """
+    Validate the basic structure of train/val/test inputs.
+    """
+
+    splits = {
+        "train": train,
+        "val": val,
+        "test": test,
+    }
+
+    for split_name, df in splits.items():
+
+        if not isinstance(df, pd.DataFrame):
+            raise CleaningError(
+                f"{split_name} must be a pandas DataFrame."
+            )
+
+        if df.empty:
+            raise CleaningError(
+                f"{split_name} DataFrame is empty."
+            )
+
+    # Target must exist in all splits because the project is supervised.
+
+    for split_name, df in splits.items():
+
+        if _TARGET not in df.columns:
+            raise CleaningError(
+                f"Target column '{_TARGET}' is missing from {split_name}."
+            )
+
+
+# =============================================================================
+# STRICT MISSING-VALUE VALIDATION
+# =============================================================================
+
+def _check_unexpected_nans(
+    df: pd.DataFrame,
+    allowed_cols: list[str],
+    split_name: str,
+) -> None:
+    """
+    Ensure that missing values exist only in explicitly declared
+    imputation columns.
+
+    Target is intentionally excluded from imputation and therefore
+    missing target values are considered an error.
+    """
+
+    nan_columns = df.columns[
+        df.isna().any()
+    ].tolist()
+
+    # Target missingness is never acceptable.
+
+    if _TARGET in nan_columns:
+
+        raise CleaningError(
+            f"[{split_name}] Target column '{_TARGET}' "
+            "contains missing values. "
+            "Target values must be present before cleaning."
+        )
+
+    unexpected_nans = [
+        column
+        for column in nan_columns
+        if column not in allowed_cols
+    ]
+
+    if unexpected_nans:
+
+        raise CleaningError(
+            f"[{split_name}] Unexpected missing values found in "
+            f"columns: {sorted(unexpected_nans)}. "
+            f"Only explicitly configured columns may be imputed: "
+            f"{sorted(allowed_cols)}."
+        )
+
+
+# =============================================================================
+# IMPUTATION
+# =============================================================================
+
+def fit_imputer(
+    train: pd.DataFrame,
+    allowed_cols: list[str],
+    strategies: dict[str, str],
+) -> dict[str, Any]:
+    """
+    Fit imputation statistics using TRAIN ONLY.
+
+    No validation or test data is used to calculate statistics.
+
+    Returns
+    -------
+    dict
+        Mapping:
+
+            column -> train-derived fill value
+    """
+
+    _check_unexpected_nans(
         train,
-        features=eda_config.lof_features,
-        contamination=eda_config.lof_contamination,
-        n_neighbors=eda_config.lof_n_neighbors,
-    )
-    train = apply_lof_flag(train, lof_model, lof_features_used)
-    val   = apply_lof_flag(val,   lof_model, lof_features_used)
-    test  = apply_lof_flag(test,  lof_model, lof_features_used)
-
-    n_lof_train = int((train["lof_outlier"] == 1).sum())
-
-    # -- Assemble result ---------------------------------------------------------
-    result = CleaningResult(
-        train=train,
-        val=val,
-        test=test,
-        imputation_median=imputer_stats.get("total_bedrooms"),
-        lof_n_outliers_train=n_lof_train,
-        eda_config_source=eda_config.source,
+        allowed_cols,
+        "train",
     )
 
-    # -- Save artifacts ------------------------------------------------------------
-    if save_artifacts_flag:
-        save_artifacts(imputer_stats, lof_model, lof_features_used, eda_config)
+    stats: dict[str, Any] = {}
 
-    # -- Save CSVs ----------------------------------------------------------------
-    result = save_cleaned_splits(result, output_dir=output_dir)
+    for column in allowed_cols:
 
-    # -- DVC tracking --------------------------------------------------------------
-    if auto_track_dvc:
-        track_processed_with_dvc(result)
-    else:
-        logger.info("auto_track_dvc=False - skipping DVC tracking.")
+        if column not in train.columns:
 
-    logger.info("\n" + result.summary())
+            raise CleaningError(
+                f"Configured imputation column '{column}' "
+                "does not exist in train dataset."
+            )
+
+        strategy = strategies.get(
+            column,
+            "median",
+        )
+
+        # ---------------------------------------------------------------------
+        # Numeric median
+        # ---------------------------------------------------------------------
+
+        if strategy == "median":
+
+            if not pd.api.types.is_numeric_dtype(
+                train[column]
+            ):
+                raise CleaningError(
+                    f"Column '{column}' is configured for median "
+                    "imputation but is not numeric."
+                )
+
+            median_value = train[column].median()
+
+            if pd.isna(median_value):
+
+                raise CleaningError(
+                    f"Cannot calculate median for '{column}'. "
+                    "The column contains no valid values."
+                )
+
+            stats[column] = float(
+                median_value
+            )
+
+            logger.info(
+                f"Imputer fitted on train: "
+                f"{column} -> median={median_value}"
+            )
+
+        # ---------------------------------------------------------------------
+        # Numeric mean
+        # ---------------------------------------------------------------------
+
+        elif strategy == "mean":
+
+            if not pd.api.types.is_numeric_dtype(
+                train[column]
+            ):
+                raise CleaningError(
+                    f"Column '{column}' is configured for mean "
+                    "imputation but is not numeric."
+                )
+
+            mean_value = train[column].mean()
+
+            if pd.isna(mean_value):
+
+                raise CleaningError(
+                    f"Cannot calculate mean for '{column}'."
+                )
+
+            stats[column] = float(
+                mean_value
+            )
+
+            logger.info(
+                f"Imputer fitted on train: "
+                f"{column} -> mean={mean_value}"
+            )
+
+        # ---------------------------------------------------------------------
+        # Mode
+        # ---------------------------------------------------------------------
+
+        elif strategy == "mode":
+
+            mode_values = train[column].mode()
+
+            if mode_values.empty:
+
+                raise CleaningError(
+                    f"Cannot calculate mode for '{column}'."
+                )
+
+            stats[column] = mode_values.iloc[0]
+
+            logger.info(
+                f"Imputer fitted on train: "
+                f"{column} -> mode={stats[column]}"
+            )
+
+        else:
+
+            raise CleaningError(
+                f"Unsupported imputation strategy '{strategy}' "
+                f"for column '{column}'. "
+                "Supported strategies: median, mean, mode."
+            )
+
+    return stats
+
+
+def apply_imputer(
+    df: pd.DataFrame,
+    imputer_stats: dict[str, Any],
+    allowed_cols: list[str],
+    split_name: str,
+) -> pd.DataFrame:
+    """
+    Apply train-fitted imputation statistics to a dataset.
+
+    IMPORTANT:
+    This function NEVER calculates new statistics.
+    """
+
+    _check_unexpected_nans(
+        df,
+        allowed_cols,
+        split_name,
+    )
+
+    result = df.copy()
+
+    for column, fill_value in imputer_stats.items():
+
+        if column not in result.columns:
+
+            raise CleaningError(
+                f"[{split_name}] Imputation column '{column}' "
+                "is missing from the dataset."
+            )
+
+        missing_count = int(
+            result[column].isna().sum()
+        )
+
+        if missing_count > 0:
+
+            result[column] = result[column].fillna(
+                fill_value
+            )
+
+            logger.info(
+                f"[{split_name}] Imputed '{column}': "
+                f"{missing_count:,} values."
+            )
+
+    # -------------------------------------------------------------------------
+    # Final safety check
+    # -------------------------------------------------------------------------
+
+    remaining_nans = result.columns[
+        result.isna().any()
+    ].tolist()
+
+    if remaining_nans:
+
+        raise CleaningError(
+            f"[{split_name}] Missing values remain after "
+            f"imputation: {remaining_nans}"
+        )
+
     return result
 
 
 # =============================================================================
-# CLI  ->  python -m src.data.cleaning
+# LOF
+# =============================================================================
+
+def fit_lof(
+    train: pd.DataFrame,
+    features: list[str],
+    contamination: float,
+    n_neighbors: int,
+) -> tuple[
+    LocalOutlierFactor,
+    StandardScaler,
+    list[str],
+]:
+    """
+    Fit StandardScaler and LOF using TRAIN ONLY.
+
+    Returns
+    -------
+    lof
+        Train-fitted LocalOutlierFactor.
+
+    scaler
+        Train-fitted StandardScaler.
+
+    features
+        Exact feature list used by LOF.
+    """
+
+    # -------------------------------------------------------------------------
+    # Feature existence is a hard requirement.
+    # -------------------------------------------------------------------------
+
+    missing_features = [
+        column
+        for column in features
+        if column not in train.columns
+    ]
+
+    if missing_features:
+
+        raise CleaningError(
+            "LOF configuration references missing features: "
+            f"{sorted(missing_features)}"
+        )
+
+    # -------------------------------------------------------------------------
+    # LOF features must not contain NaN.
+    # -------------------------------------------------------------------------
+
+    lof_data = train[features]
+
+    if lof_data.isna().any().any():
+
+        nan_features = lof_data.columns[
+            lof_data.isna().any()
+        ].tolist()
+
+        raise CleaningError(
+            "LOF cannot be fitted because the following features "
+            f"contain missing values: {nan_features}"
+        )
+
+    # -------------------------------------------------------------------------
+    # Validate sample size.
+    # -------------------------------------------------------------------------
+
+    if len(lof_data) <= n_neighbors:
+
+        raise CleaningError(
+            f"LOF requires more rows than n_neighbors. "
+            f"Rows={len(lof_data)}, "
+            f"n_neighbors={n_neighbors}."
+        )
+
+    # -------------------------------------------------------------------------
+    # Validate numeric data.
+    # -------------------------------------------------------------------------
+
+    non_numeric = [
+        column
+        for column in features
+        if not pd.api.types.is_numeric_dtype(
+            train[column]
+        )
+    ]
+
+    if non_numeric:
+
+        raise CleaningError(
+            "LOF features must be numeric. "
+            f"Non-numeric features: {non_numeric}"
+        )
+
+    # -------------------------------------------------------------------------
+    # TRAIN-ONLY scaler
+    # -------------------------------------------------------------------------
+
+    scaler = StandardScaler()
+
+    train_scaled = scaler.fit_transform(
+        lof_data
+    )
+
+    # -------------------------------------------------------------------------
+    # TRAIN-ONLY LOF
+    # -------------------------------------------------------------------------
+
+    lof = LocalOutlierFactor(
+        n_neighbors=n_neighbors,
+        contamination=contamination,
+        novelty=True,
+    )
+
+    lof.fit(train_scaled)
+
+    logger.info(
+        "LOF fitted successfully."
+    )
+
+    logger.info(
+        f"Rows: {len(lof_data):,}"
+    )
+
+    logger.info(
+        f"Features: {features}"
+    )
+
+    logger.info(
+        f"Contamination: {contamination}"
+    )
+
+    logger.info(
+        f"n_neighbors: {n_neighbors}"
+    )
+
+    return (
+        lof,
+        scaler,
+        features,
+    )
+
+
+def apply_lof_flag(
+    df: pd.DataFrame,
+    lof: LocalOutlierFactor,
+    scaler: StandardScaler,
+    features: list[str],
+    split_name: str,
+) -> pd.DataFrame:
+    """
+    Apply a TRAIN-FITTED LOF model to a dataset.
+
+    No fitting occurs here.
+    """
+
+    result = df.copy()
+
+    # -------------------------------------------------------------------------
+    # Validate required features.
+    # -------------------------------------------------------------------------
+
+    missing_features = [
+        column
+        for column in features
+        if column not in result.columns
+    ]
+
+    if missing_features:
+
+        raise CleaningError(
+            f"[{split_name}] LOF features missing: "
+            f"{sorted(missing_features)}"
+        )
+
+    lof_data = result[features]
+
+    # -------------------------------------------------------------------------
+    # No missing values allowed.
+    # -------------------------------------------------------------------------
+
+    if lof_data.isna().any().any():
+
+        nan_features = lof_data.columns[
+            lof_data.isna().any()
+        ].tolist()
+
+        raise CleaningError(
+            f"[{split_name}] LOF features contain NaN: "
+            f"{nan_features}"
+        )
+
+    # -------------------------------------------------------------------------
+    # Transform using TRAIN-FITTED scaler.
+    # -------------------------------------------------------------------------
+
+    scaled_data = scaler.transform(
+        lof_data
+    )
+
+    # -------------------------------------------------------------------------
+    # Predict using TRAIN-FITTED LOF.
+    # -------------------------------------------------------------------------
+
+    predictions = lof.predict(
+        scaled_data
+    )
+
+    # sklearn:
+    #
+    #   +1 = inlier
+    #   -1 = outlier
+    #
+    result["lof_outlier"] = (
+        predictions == -1
+    ).astype("int8")
+
+    n_outliers = int(
+        result["lof_outlier"].sum()
+    )
+
+    logger.info(
+        f"[{split_name}] LOF outliers: "
+        f"{n_outliers:,} / {len(result):,}"
+    )
+
+    return result
+
+
+# =============================================================================
+# ARTIFACTS
+# =============================================================================
+
+def save_artifacts(
+    imputer_stats: dict[str, Any],
+    lof: LocalOutlierFactor,
+    lof_scaler: StandardScaler,
+    lof_features: list[str],
+    eda_config: EdaConfig,
+    output_dir: Optional[Path] = None,
+) -> Path:
+    """
+    Save train-fitted cleaning artifacts.
+
+    Artifacts contain everything required to reproduce the cleaning
+    transformation on future data.
+    """
+
+    artifacts_dir = (
+        output_dir
+        if output_dir is not None
+        else PROJECT_DIR / _ARTIFACTS_DIRNAME
+    )
+
+    artifacts_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    # -------------------------------------------------------------------------
+    # LOF model
+    # -------------------------------------------------------------------------
+
+    lof_path = (
+        artifacts_dir /
+        _LOF_MODEL_FILENAME
+    )
+
+    with open(
+        lof_path,
+        "wb",
+    ) as f:
+
+        pickle.dump(
+            lof,
+            f,
+        )
+
+    # -------------------------------------------------------------------------
+    # LOF scaler
+    # -------------------------------------------------------------------------
+
+    scaler_path = (
+        artifacts_dir /
+        _LOF_SCALER_FILENAME
+    )
+
+    with open(
+        scaler_path,
+        "wb",
+    ) as f:
+
+        pickle.dump(
+            lof_scaler,
+            f,
+        )
+
+    # -------------------------------------------------------------------------
+    # JSON metadata
+    # -------------------------------------------------------------------------
+
+    metadata = {
+        "target": _TARGET,
+
+        "imputer_stats": imputer_stats,
+
+        "impute_columns": eda_config.impute_columns,
+
+        "imputation_strategy": eda_config.imputation_strategy,
+
+        "lof_features": lof_features,
+
+        "lof_contamination": eda_config.lof_contamination,
+
+        "lof_n_neighbors": eda_config.lof_n_neighbors,
+
+        "timestamp": datetime.now().isoformat(),
+    }
+
+    metadata_path = (
+        artifacts_dir /
+        _IMPUTER_ARTIFACT_FILENAME
+    )
+
+    with open(
+        metadata_path,
+        "w",
+        encoding="utf-8",
+    ) as f:
+
+        json.dump(
+            metadata,
+            f,
+            indent=2,
+        )
+
+    logger.info(
+        f"Cleaning artifacts saved to: {artifacts_dir}"
+    )
+
+    return metadata_path
+
+
+def load_artifacts(
+    artifacts_dir: Optional[Path] = None,
+) -> tuple[
+    dict[str, Any],
+    LocalOutlierFactor,
+    StandardScaler,
+    list[str],
+]:
+    """
+    Load train-fitted cleaning artifacts.
+    """
+
+    artifacts_dir = (
+        artifacts_dir
+        if artifacts_dir is not None
+        else PROJECT_DIR / _ARTIFACTS_DIRNAME
+    )
+
+    metadata_path = (
+        artifacts_dir /
+        _IMPUTER_ARTIFACT_FILENAME
+    )
+
+    lof_path = (
+        artifacts_dir /
+        _LOF_MODEL_FILENAME
+    )
+
+    scaler_path = (
+        artifacts_dir /
+        _LOF_SCALER_FILENAME
+    )
+
+    # -------------------------------------------------------------------------
+    # Validate artifact existence.
+    # -------------------------------------------------------------------------
+
+    for path in (
+        metadata_path,
+        lof_path,
+        scaler_path,
+    ):
+
+        if not path.exists():
+
+            raise FileNotFoundError(
+                f"Required cleaning artifact not found: {path}"
+            )
+
+    # -------------------------------------------------------------------------
+    # Load metadata
+    # -------------------------------------------------------------------------
+
+    with open(
+        metadata_path,
+        "r",
+        encoding="utf-8",
+    ) as f:
+
+        metadata = json.load(f)
+
+    # -------------------------------------------------------------------------
+    # Load LOF
+    # -------------------------------------------------------------------------
+
+    with open(
+        lof_path,
+        "rb",
+    ) as f:
+
+        lof = pickle.load(f)
+
+    # -------------------------------------------------------------------------
+    # Load scaler
+    # -------------------------------------------------------------------------
+
+    with open(
+        scaler_path,
+        "rb",
+    ) as f:
+
+        scaler = pickle.load(f)
+
+    logger.info(
+        f"Cleaning artifacts loaded from: {artifacts_dir}"
+    )
+
+    return (
+        metadata["imputer_stats"],
+        lof,
+        scaler,
+        metadata["lof_features"],
+    )
+
+
+# =============================================================================
+# SAVE CLEANED DATA
+# =============================================================================
+
+def save_cleaned_splits(
+    result: CleaningResult,
+    output_dir: Optional[Path] = None,
+) -> CleaningResult:
+    """
+    Save cleaned train/validation/test datasets.
+
+    No target-derived temporary metadata exists in this version,
+    so there is nothing to purge before saving.
+    """
+
+    output_dir = (
+        output_dir
+        if output_dir is not None
+        else ensure_path("processed")
+    )
+
+    output_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    paths = {
+        "train": output_dir / _CLEANED_TRAIN_FILENAME,
+        "val": output_dir / _CLEANED_VAL_FILENAME,
+        "test": output_dir / _CLEANED_TEST_FILENAME,
+    }
+
+    result.train.to_csv(
+        paths["train"],
+        index=False,
+    )
+
+    result.val.to_csv(
+        paths["val"],
+        index=False,
+    )
+
+    result.test.to_csv(
+        paths["test"],
+        index=False,
+    )
+
+    result.train_path = paths["train"]
+    result.val_path = paths["val"]
+    result.test_path = paths["test"]
+
+    for name, path in paths.items():
+
+        size_mb = (
+            path.stat().st_size /
+            (1024 * 1024)
+        )
+
+        logger.info(
+            f"Saved {name}: "
+            f"{path} "
+            f"({size_mb:.2f} MB)"
+        )
+
+    return result
+
+
+# =============================================================================
+# MAIN CLEANING PIPELINE
+# =============================================================================
+
+def run_cleaning(
+    train: pd.DataFrame,
+    val: pd.DataFrame,
+    test: pd.DataFrame,
+    config_path: str | Path = _DEFAULT_CONFIG_PATH,
+    output_dir: Optional[Path] = None,
+    artifacts_dir: Optional[Path] = None,
+    save_artifacts_flag: bool = True,
+) -> CleaningResult:
+    """
+    Execute the complete data-cleaning pipeline.
+
+    Pipeline
+    --------
+        1. Validate inputs
+        2. Load EDA config
+        3. Fit imputer on train
+        4. Apply imputer to train/val/test
+        5. Fit StandardScaler on train for LOF
+        6. Fit LOF on train
+        7. Predict LOF on train/val/test
+        8. Save train-fitted artifacts
+        9. Save cleaned datasets
+
+    IMPORTANT
+    ---------
+    No DVC/Git operations are performed here.
+    """
+
+    logger.info("=" * 70)
+    logger.info("DATA CLEANING STARTED")
+    logger.info("=" * 70)
+
+    # =========================================================================
+    # STEP 1 — INPUT VALIDATION
+    # =========================================================================
+
+    logger.info(
+        "Step 1/6 - Validating cleaning inputs..."
+    )
+
+    validate_cleaning_inputs(
+        train,
+        val,
+        test,
+    )
+
+    # =========================================================================
+    # STEP 2 — LOAD CONFIG
+    # =========================================================================
+
+    logger.info(
+        "Step 2/6 - Loading EDA-derived configuration..."
+    )
+
+    eda_config = load_eda_config(
+        config_path
+    )
+
+    # =========================================================================
+    # STEP 3 — IMPUTATION
+    # =========================================================================
+
+    logger.info(
+        "Step 3/6 - Train-only imputation..."
+    )
+
+    imputer_stats = fit_imputer(
+        train=train,
+        allowed_cols=eda_config.impute_columns,
+        strategies=eda_config.imputation_strategy,
+    )
+
+    train = apply_imputer(
+        df=train,
+        imputer_stats=imputer_stats,
+        allowed_cols=eda_config.impute_columns,
+        split_name="train",
+    )
+
+    val = apply_imputer(
+        df=val,
+        imputer_stats=imputer_stats,
+        allowed_cols=eda_config.impute_columns,
+        split_name="val",
+    )
+
+    test = apply_imputer(
+        df=test,
+        imputer_stats=imputer_stats,
+        allowed_cols=eda_config.impute_columns,
+        split_name="test",
+    )
+
+    # =========================================================================
+    # STEP 4 — LOF FIT
+    # =========================================================================
+
+    logger.info(
+        "Step 4/6 - Fitting LOF on train only..."
+    )
+
+    lof_model, lof_scaler, lof_features = fit_lof(
+        train=train,
+        features=eda_config.lof_features,
+        contamination=eda_config.lof_contamination,
+        n_neighbors=eda_config.lof_n_neighbors,
+    )
+
+    # =========================================================================
+    # STEP 5 — LOF TRANSFORMATION
+    # =========================================================================
+
+    logger.info(
+        "Step 5/6 - Applying train-fitted LOF..."
+    )
+
+    train = apply_lof_flag(
+        df=train,
+        lof=lof_model,
+        scaler=lof_scaler,
+        features=lof_features,
+        split_name="train",
+    )
+
+    val = apply_lof_flag(
+        df=val,
+        lof=lof_model,
+        scaler=lof_scaler,
+        features=lof_features,
+        split_name="val",
+    )
+
+    test = apply_lof_flag(
+        df=test,
+        lof=lof_model,
+        scaler=lof_scaler,
+        features=lof_features,
+        split_name="test",
+    )
+
+    # =========================================================================
+    # STEP 6 — SAVE
+    # =========================================================================
+
+    logger.info(
+        "Step 6/6 - Saving outputs and artifacts..."
+    )
+
+    result = CleaningResult(
+        train=train,
+        val=val,
+        test=test,
+        imputation_statistics=imputer_stats,
+        lof_n_outliers_train=int(
+            train["lof_outlier"].sum()
+        ),
+    )
+
+    # -------------------------------------------------------------------------
+    # Save train-fitted artifacts
+    # -------------------------------------------------------------------------
+
+    if save_artifacts_flag:
+
+        save_artifacts(
+            imputer_stats=imputer_stats,
+            lof=lof_model,
+            lof_scaler=lof_scaler,
+            lof_features=lof_features,
+            eda_config=eda_config,
+            output_dir=artifacts_dir,
+        )
+
+    # -------------------------------------------------------------------------
+    # Save cleaned datasets
+    # -------------------------------------------------------------------------
+
+    result = save_cleaned_splits(
+        result,
+        output_dir=output_dir,
+    )
+
+    logger.info("")
+    logger.info(
+        result.summary()
+    )
+
+    logger.info(
+        "DATA CLEANING COMPLETED SUCCESSFULLY"
+    )
+
+    return result
+
+
+# =============================================================================
+# CLI
+# =============================================================================
+#
+# Run:
+#
+#     python -m src.data.cleaning
+#
+# The CLI is intentionally simple.
+# DVC should call the module/function from the pipeline layer.
+#
 # =============================================================================
 
 if __name__ == "__main__":
-    import sys
-    from src.data.data_loader import DataLoader
-    from src.data.validation import validate_dataframe, ValidationError
 
-    config = "configs/data_config.yaml"
+    import sys
+
+    from src.data.data_loader import DataLoader
+    from src.data.validation import (
+        ValidationError,
+        validate_dataframe,
+    )
+
+    config = _DEFAULT_CONFIG_PATH
+
     loader = DataLoader()
 
-    logger.info("Loading interim splits...")
-    train = loader.load_interim("train.csv")
-    val   = loader.load_interim("val.csv")
-    test  = loader.load_interim("test.csv")
+    logger.info(
+        "Loading interim datasets..."
+    )
 
     try:
-        validate_dataframe(train, config_path=config, raise_on_failure=True)
-    except ValidationError as e:
-        logger.error(f"Validation failed: {e}")
+
+        train = loader.load_interim(
+            "train.csv"
+        )
+
+        val = loader.load_interim(
+            "val.csv"
+        )
+
+        test = loader.load_interim(
+            "test.csv"
+        )
+
+    except Exception as exc:
+
+        logger.error(
+            f"Failed to load interim datasets: {exc}"
+        )
+
         sys.exit(1)
 
-    result = run_cleaning(train, val, test, config_path=config)
-    print(result.summary())
+    # -------------------------------------------------------------------------
+    # Validate train against project data contract.
+    #
+    # Validation does NOT modify the dataframe.
+    # -------------------------------------------------------------------------
+
+    try:
+
+        validate_dataframe(
+            train,
+            config_path=config,
+            raise_on_failure=True,
+        )
+
+    except ValidationError as exc:
+
+        logger.error(
+            f"Validation failed: {exc}"
+        )
+
+        sys.exit(1)
+
+    # -------------------------------------------------------------------------
+    # Run cleaning.
+    # -------------------------------------------------------------------------
+
+    try:
+
+        result = run_cleaning(
+            train=train,
+            val=val,
+            test=test,
+            config_path=config,
+        )
+
+    except (CleaningError, FileNotFoundError, KeyError) as exc:
+
+        logger.error(
+            f"Cleaning failed: {exc}"
+        )
+
+        sys.exit(1)
+
+    print(
+        result.summary()
+    )
+
     sys.exit(0)
 
+
+# =============================================================================
+# PUBLIC API
+# =============================================================================
 
 __all__ = [
     "CleaningError",
     "CleaningResult",
     "EdaConfig",
     "load_eda_config",
+    "validate_cleaning_inputs",
     "fit_imputer",
     "apply_imputer",
-    "add_is_capped_flag",
-    "apply_log1p",
     "fit_lof",
     "apply_lof_flag",
     "save_artifacts",
     "load_artifacts",
+    "save_cleaned_splits",
     "run_cleaning",
 ]
