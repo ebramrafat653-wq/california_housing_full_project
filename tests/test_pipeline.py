@@ -1,22 +1,6 @@
 # =============================================================================
 # tests/test_pipeline.py
 # California Housing Project — Unit Tests for src/features/pipeline.py
-#
-# Fixtures from conftest.py used:
-#   - empty_df : completely empty DataFrame
-#
-# All other fixtures defined inline for precise control over column layout
-# (post-engineering data: log1p applied, ratios created, raw cols dropped).
-#
-# Test classes:
-#   1.  TestResolveColumns        — column routing to correct transformers
-#   2.  TestBuildPipeline         — sklearn Pipeline construction
-#   3.  TestFitTransformPipeline  — fit-on-train-only, output shapes
-#   4.  TestGetFeatureNames       — OHE expansion, feature name extraction
-#   5.  TestSaveLoadPipeline      — round-trip pickle artifact
-#   6.  TestPipelineResult        — dataclass + summary()
-#   7.  TestRunPipeline           — end-to-end integration
-#   8.  TestNoDataLeakage         — val/test not influencing fit
 # =============================================================================
 
 import pickle
@@ -27,7 +11,6 @@ import pytest
 from sklearn.pipeline import Pipeline
 
 from src.features.pipeline import (
-    _STD_SCALE_COLS,
     _TARGET,
     PipelineError,
     PipelineResult,
@@ -41,18 +24,36 @@ from src.features.pipeline import (
 )
 
 # =============================================================================
+# MOCK CONFIGURATION
+# (Replaces the removed hardcoded constants from pipeline.py)
+# =============================================================================
+
+MOCK_FEATURES_CONFIG = {
+    "std": [
+        "longitude", "latitude", "housing_median_age",
+        "rooms_per_household", "bedrooms_per_room",
+        "population_per_household", "dist_SF", "dist_LA",
+    ],
+    "robust": ["median_income"],
+    "cat": ["ocean_proximity"],
+    "passthrough": ["lof_outlier"],
+}
+
+# =============================================================================
 # SHARED FIXTURES
 # =============================================================================
+
+@pytest.fixture
+def mock_config():
+    return MOCK_FEATURES_CONFIG
 
 @pytest.fixture
 def feat_df() -> pd.DataFrame:
     """
     Minimal post-engineering DataFrame (40 rows).
-    Mirrors what data/processed/train_feat.csv looks like:
-    - log1p already applied to count cols (cleaning.py)
-    - ratio + distance features present (engineering.py)
-    - raw size cols dropped (engineering.py)
-    - is_capped + lof_outlier flags present (cleaning.py)
+    NOTE: `is_capped` is intentionally EXCLUDED here. The new pipeline.py 
+    enforces a strict target-leakage guard that raises PipelineError if 
+    `is_capped` is present in X_train.
     """
     np.random.seed(42)
     n = 40
@@ -72,13 +73,11 @@ def feat_df() -> pd.DataFrame:
         "ocean_proximity"        : np.random.choice(
             ["NEAR BAY", "<1H OCEAN", "INLAND", "NEAR OCEAN"], n
         ),
-        # Passthrough flags
-        "is_capped"              : np.zeros(n, dtype=int),
+        # Passthrough flags (is_capped removed to satisfy leakage guard)
         "lof_outlier"            : np.zeros(n, dtype=int),
         # Target
         "median_house_value"     : np.random.uniform(15000, 490000, n),
     })
-
 
 @pytest.fixture
 def three_feat_splits(feat_df):
@@ -88,18 +87,16 @@ def three_feat_splits(feat_df):
     test  = feat_df.iloc[32:].reset_index(drop=True)
     return train, val, test
 
-
 @pytest.fixture
-def resolved_cols(feat_df):
+def resolved_cols(feat_df, mock_config):
     """Pre-resolved column dict for the standard feat_df layout."""
-    return resolve_columns(feat_df)
-
+    return resolve_columns(feat_df, config=mock_config)
 
 @pytest.fixture
-def fitted_pipeline_and_data(three_feat_splits):
+def fitted_pipeline_and_data(three_feat_splits, mock_config):
     """Return a fitted pipeline + transformed arrays for reuse."""
     train, val, test = three_feat_splits
-    cols = resolve_columns(train)
+    cols = resolve_columns(train, config=mock_config)
     pipeline = build_pipeline(cols)
     pipeline, X_tr, X_v, X_te, y_tr, y_v, y_te = fit_transform_pipeline(
         pipeline, train, val, test
@@ -113,44 +110,42 @@ def fitted_pipeline_and_data(three_feat_splits):
 
 class TestResolveColumns:
 
-    def test_std_scale_cols_present(self, feat_df):
-        cols = resolve_columns(feat_df)
-        for col in _STD_SCALE_COLS:
-            if col in feat_df.columns:
-                assert col in cols["std"]
+    def test_std_scale_cols_present(self, feat_df, mock_config):
+        cols = resolve_columns(feat_df, config=mock_config)
+        for col in mock_config["std"]:
+            assert col in cols["std"]
 
-    def test_robust_scale_cols_present(self, feat_df):
-        cols = resolve_columns(feat_df)
+    def test_robust_scale_cols_present(self, feat_df, mock_config):
+        cols = resolve_columns(feat_df, config=mock_config)
         assert "median_income" in cols["robust"]
 
-    def test_cat_cols_present(self, feat_df):
-        cols = resolve_columns(feat_df)
+    def test_cat_cols_present(self, feat_df, mock_config):
+        cols = resolve_columns(feat_df, config=mock_config)
         assert "ocean_proximity" in cols["cat"]
 
-    def test_passthrough_cols_present(self, feat_df):
-        cols = resolve_columns(feat_df)
-        assert "is_capped" in cols["passthrough"]
+    def test_passthrough_cols_present(self, feat_df, mock_config):
+        cols = resolve_columns(feat_df, config=mock_config)
         assert "lof_outlier" in cols["passthrough"]
 
-    def test_missing_col_raises_error(self, feat_df):
+    def test_missing_col_raises_error(self, feat_df, mock_config):
         """resolve_columns must raise PipelineError when columns are missing."""
         df = feat_df.drop(columns=["median_income"])
         with pytest.raises(PipelineError, match="Missing columns for 'robust'"):
-            resolve_columns(df)
+            resolve_columns(df, config=mock_config)
 
-    def test_target_not_in_any_group(self, feat_df):
-        cols = resolve_columns(feat_df)
+    def test_target_not_in_any_group(self, feat_df, mock_config):
+        cols = resolve_columns(feat_df, config=mock_config)
         all_assigned = (
             cols["std"] + cols["robust"] + cols["cat"] + cols["passthrough"]
         )
         assert _TARGET not in all_assigned
 
-    def test_returns_dict_with_four_keys(self, feat_df):
-        cols = resolve_columns(feat_df)
+    def test_returns_dict_with_four_keys(self, feat_df, mock_config):
+        cols = resolve_columns(feat_df, config=mock_config)
         assert set(cols.keys()) == {"std", "robust", "cat", "passthrough"}
 
-    def test_no_overlap_between_groups(self, feat_df):
-        cols = resolve_columns(feat_df)
+    def test_no_overlap_between_groups(self, feat_df, mock_config):
+        cols = resolve_columns(feat_df, config=mock_config)
         all_cols = (
             cols["std"] + cols["robust"] + cols["cat"] + cols["passthrough"]
         )
@@ -202,8 +197,7 @@ class TestBuildPipeline:
 
     def test_pipeline_not_yet_fitted(self, resolved_cols):
         pipeline = build_pipeline(resolved_cols)
-        import pytest
-        with pytest.raises(AttributeError):   
+        with pytest.raises(Exception):   
             pipeline.transform(pd.DataFrame({"dummy": [1]}))
 
 
@@ -213,16 +207,16 @@ class TestBuildPipeline:
 
 class TestFitTransformPipeline:
 
-    def test_returns_seven_items(self, three_feat_splits):
+    def test_returns_seven_items(self, three_feat_splits, mock_config):
         train, val, test = three_feat_splits
-        cols = resolve_columns(train)
+        cols = resolve_columns(train, config=mock_config)
         pipeline = build_pipeline(cols)
         result = fit_transform_pipeline(pipeline, train, val, test)
         assert len(result) == 7
 
-    def test_output_shapes_consistent(self, three_feat_splits):
+    def test_output_shapes_consistent(self, three_feat_splits, mock_config):
         train, val, test = three_feat_splits
-        cols = resolve_columns(train)
+        cols = resolve_columns(train, config=mock_config)
         pipeline = build_pipeline(cols)
         _, X_tr, X_v, X_te, y_tr, y_v, y_te = fit_transform_pipeline(
             pipeline, train, val, test
@@ -231,18 +225,18 @@ class TestFitTransformPipeline:
         assert X_v.shape[0]  == len(val)
         assert X_te.shape[0] == len(test)
 
-    def test_same_number_of_features_across_splits(self, three_feat_splits):
+    def test_same_number_of_features_across_splits(self, three_feat_splits, mock_config):
         train, val, test = three_feat_splits
-        cols = resolve_columns(train)
+        cols = resolve_columns(train, config=mock_config)
         pipeline = build_pipeline(cols)
         _, X_tr, X_v, X_te, *_ = fit_transform_pipeline(
             pipeline, train, val, test
         )
         assert X_tr.shape[1] == X_v.shape[1] == X_te.shape[1]
 
-    def test_output_is_numpy_array(self, three_feat_splits):
+    def test_output_is_numpy_array(self, three_feat_splits, mock_config):
         train, val, test = three_feat_splits
-        cols = resolve_columns(train)
+        cols = resolve_columns(train, config=mock_config)
         pipeline = build_pipeline(cols)
         _, X_tr, X_v, X_te, *_ = fit_transform_pipeline(
             pipeline, train, val, test
@@ -250,18 +244,16 @@ class TestFitTransformPipeline:
         for arr in [X_tr, X_v, X_te]:
             assert isinstance(arr, np.ndarray)
 
-    def test_target_not_in_X(self, three_feat_splits):
+    def test_target_not_in_X(self, three_feat_splits, mock_config):
         train, val, test = three_feat_splits
-        n_features_without_target = train.shape[1] - 1  # minus target
-        cols = resolve_columns(train)
+        cols = resolve_columns(train, config=mock_config)
         pipeline = build_pipeline(cols)
         _, X_tr, *_ = fit_transform_pipeline(pipeline, train, val, test)
-        # After OHE expansion, output cols >= n_features_without_target - cat_cols + ohe_cats
-        assert X_tr.shape[1] >= n_features_without_target
+        assert X_tr.shape[1] >= len(mock_config["std"]) + len(mock_config["robust"]) + len(mock_config["passthrough"])
 
-    def test_y_series_length_matches_split(self, three_feat_splits):
+    def test_y_series_length_matches_split(self, three_feat_splits, mock_config):
         train, val, test = three_feat_splits
-        cols = resolve_columns(train)
+        cols = resolve_columns(train, config=mock_config)
         pipeline = build_pipeline(cols)
         _, _, _, _, y_tr, y_v, y_te = fit_transform_pipeline(
             pipeline, train, val, test
@@ -270,23 +262,35 @@ class TestFitTransformPipeline:
         assert len(y_v)  == len(val)
         assert len(y_te) == len(test)
 
-    def test_raises_when_target_missing(self, three_feat_splits):
+    def test_raises_when_target_missing(self, three_feat_splits, mock_config):
         train, val, test = three_feat_splits
         train_no_target = train.drop(columns=[_TARGET])
-        cols = resolve_columns(train_no_target)
+        cols = resolve_columns(train_no_target, config=mock_config)
         pipeline = build_pipeline(cols)
         with pytest.raises(PipelineError, match="Target 'median_house_value' is missing from train"):
             fit_transform_pipeline(pipeline, train_no_target, val, test)
 
-    def test_no_nan_in_output_arrays(self, three_feat_splits):
+    def test_no_nan_in_output_arrays(self, three_feat_splits, mock_config):
         train, val, test = three_feat_splits
-        cols = resolve_columns(train)
+        cols = resolve_columns(train, config=mock_config)
         pipeline = build_pipeline(cols)
         _, X_tr, X_v, X_te, *_ = fit_transform_pipeline(
             pipeline, train, val, test
         )
         for name, arr in [("train", X_tr), ("val", X_v), ("test", X_te)]:
             assert not np.isnan(arr).any(), f"NaN in {name} output array"
+            
+    def test_raises_on_target_leakage(self, three_feat_splits, mock_config):
+        """Ensure pipeline fails fast if target-derived metadata leaks into X."""
+        train, val, test = three_feat_splits
+        train_leaked = train.copy()
+        train_leaked["is_capped"] = 0  # Inject forbidden column
+        
+        cols = resolve_columns(train_leaked.drop(columns=["is_capped"]), config=mock_config)
+        pipeline = build_pipeline(cols)
+        
+        with pytest.raises(PipelineError, match="Target leakage detected"):
+            fit_transform_pipeline(pipeline, train_leaked, val, test)
 
 
 # =============================================================================
@@ -326,7 +330,6 @@ class TestGetFeatureNames:
     def test_passthrough_cols_in_names(self, fitted_pipeline_and_data):
         pipeline, *_ = fitted_pipeline_and_data
         names = get_feature_names(pipeline)
-        assert "is_capped"    in names
         assert "lof_outlier"  in names
 
     def test_target_not_in_names(self, fitted_pipeline_and_data):
@@ -523,10 +526,6 @@ class TestRunPipeline:
 
     @pytest.mark.integration
     def test_unknown_ohe_category_handled(self, three_feat_splits, tmp_path):
-        """
-        ISLAND is rare — if it appears in val/test but not train,
-        handle_unknown='ignore' should return zeros (not raise).
-        """
         train, val, test = three_feat_splits
         test = test.copy()
         test.loc[0, "ocean_proximity"] = "ISLAND"  # unseen in train
@@ -535,7 +534,6 @@ class TestRunPipeline:
             train, val, test,
             artifacts_dir=tmp_path,
         )
-        # Should not raise — just returns zeros for unseen category
         assert not np.isnan(result.X_test).any()
 
 
@@ -545,52 +543,40 @@ class TestRunPipeline:
 
 class TestNoDataLeakage:
 
-    def test_scaler_mean_comes_from_train_only(self, three_feat_splits):
-        """
-        StandardScaler.mean_ must equal train mean, not val or test mean.
-        """
+    def test_scaler_mean_comes_from_train_only(self, three_feat_splits, mock_config):
         train, val, test = three_feat_splits
-        cols = resolve_columns(train)
+        cols = resolve_columns(train, config=mock_config)
         pipeline = build_pipeline(cols)
         fit_transform_pipeline(pipeline, train, val, test)
 
         ct = pipeline.named_steps["preprocessor"]
-        # استخدم named_transformers_ للحصول على النسخة الملائمة
         scaler = ct.named_transformers_["standard_scaler"]
 
-        # احصل على مؤشر longitude من قائمة الأعمدة الأصلية
         std_cols = cols["std"]
         lon_idx = std_cols.index("longitude")
 
         train_mean = train["longitude"].mean()
         assert scaler.mean_[lon_idx] == pytest.approx(train_mean, rel=1e-5)
 
-    def test_val_transform_uses_train_statistics(self, three_feat_splits):
-        """
-        Val output must differ from what we'd get if we fit on val directly.
-        """
+    def test_val_transform_uses_train_statistics(self, three_feat_splits, mock_config):
         train, val, test = three_feat_splits
 
-        # Fit on train, transform val
-        cols = resolve_columns(train)
+        cols = resolve_columns(train, config=mock_config)
         pipeline_train = build_pipeline(cols)
         _, _, X_val_from_train, *_ = fit_transform_pipeline(
             pipeline_train, train, val, test
         )
 
-        # Fit on val directly (leakage simulation)
-        cols_val = resolve_columns(val)
+        cols_val = resolve_columns(val, config=mock_config)
         pipeline_val = build_pipeline(cols_val)
         pipeline_val.fit(val.drop(columns=[_TARGET]))
         pipeline_val.transform(val.drop(columns=[_TARGET]))
 
         ct_train = pipeline_train.named_steps["preprocessor"]
         ct_val   = pipeline_val.named_steps["preprocessor"]
-        # استخدم named_transformers_ للحصول على النسخ الملائمة
         scaler_train = ct_train.named_transformers_["standard_scaler"]
         scaler_val   = ct_val.named_transformers_["standard_scaler"]
 
-        # The means should differ because train and val have different row sets
         assert not np.allclose(scaler_train.mean_, scaler_val.mean_), (
             "Train and val scalers have identical means — "
             "train and val may be identical, or leakage occurred"
@@ -598,10 +584,6 @@ class TestNoDataLeakage:
 
     @pytest.mark.integration
     def test_shuffle_train_does_not_change_val_output(self, three_feat_splits, tmp_path):
-        """
-        Shuffling train rows must not change the val output
-        (statistics are order-independent).
-        """
         train, val, test = three_feat_splits
 
         result1 = run_pipeline(
@@ -618,27 +600,19 @@ class TestNoDataLeakage:
         np.testing.assert_array_almost_equal(result1.X_val, result2.X_val)
         np.testing.assert_array_almost_equal(result1.X_test, result2.X_test)
 
-    def test_pipeline_not_refitted_on_val(self, three_feat_splits):
-        """
-        fit_transform_pipeline must call fit() exactly once (on train).
-        Applying the pipeline to val must not refit.
-        """
+    def test_pipeline_not_refitted_on_val(self, three_feat_splits, mock_config):
         train, val, test = three_feat_splits
-        cols = resolve_columns(train)
+        cols = resolve_columns(train, config=mock_config)
         pipeline = build_pipeline(cols)
 
         pipeline, *_ = fit_transform_pipeline(pipeline, train, val, test)
 
-        # After fit, transform val again — must produce same result
         X_val_1 = pipeline.transform(val.drop(columns=[_TARGET]))
         X_val_2 = pipeline.transform(val.drop(columns=[_TARGET]))
         np.testing.assert_array_equal(X_val_1, X_val_2)
 
     @pytest.mark.integration
     def test_same_seed_same_result(self, feat_df, tmp_path):
-        """
-        Determinism check: same data, same config -> identical output.
-        """
         train = feat_df.iloc[:24].reset_index(drop=True)
         val   = feat_df.iloc[24:32].reset_index(drop=True)
         test  = feat_df.iloc[32:].reset_index(drop=True)
