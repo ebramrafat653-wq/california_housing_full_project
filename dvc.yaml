@@ -99,7 +99,7 @@ stages:
       - configs/data_config.yaml:
           - features_config            
     outs:
-      - artifacts/engineering_artifacts.json
+      - artifacts/preprocessing_pipeline.pkl
 
 
   # ============================================================
