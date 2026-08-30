@@ -1,22 +1,22 @@
+# =============================================================================
 # src/utils/colab_setup.py
+# California Housing Project — Colab Environment Initialization
+#
+# RESPONSIBILITY:
+#   Bootstrap a fully functional development environment inside Google Colab.
+#
+# WORKFLOW:
+#   1. mount_drive()
+#   2. configure_ssh()
+#   3. clone_or_update_repo()
+#   4. setup_drive_symlinks()   ← AFTER clone (repo must exist)
+#   5. install_dependencies()   ← Uses pyproject.toml ONLY
+#   6. initialize_dvc()         ← Always ensures remote + cache are set
+#   7. dvc_pull()               ← Pulls data/raw from Drive remote
+#   8. sys.path + os.chdir()
+# =============================================================================
 
-"""
-Colab environment initialization module.
-
-Authentication  : SSH key stored on Google Drive (MyDrive/ssh_config/housing_key).
-DVC remote type : local path on Drive  (/content/drive/MyDrive/dvc_storage).
-                  No OAuth, no gdrive:// — Drive is already mounted as a filesystem.
-
-Session workflow:
-  1. mount_drive()
-  2. configure_ssh()
-  3. clone_or_update_repo()
-  4. setup_drive_symlinks()   ← AFTER clone (repo must exist)
-  5. install_dependencies()   ← Uses pyproject.toml ONLY
-  6. initialize_dvc()         ← always ensures remote + cache are set
-  7. dvc_pull()               ← pull data/raw from Drive remote
-  8. sys.path + os.chdir()
-"""
+from __future__ import annotations
 
 import json
 import os
@@ -97,12 +97,6 @@ def _run_out(
         return r.stdout.strip() if r.returncode == 0 else None
     except Exception:
         return None
-
-
-def _configure_git_identity(repo_path: Path, name: str, email: str) -> None:
-    """Set git user.name and user.email (prevents commit errors in Colab)."""
-    _run(f"git config user.name  '{name}'",  cwd=repo_path, silent=True)
-    _run(f"git config user.email '{email}'", cwd=repo_path, silent=True)
 
 
 # =============================================================================
@@ -263,7 +257,7 @@ def _ensure_dvc_installed(repo_path: Path) -> bool:
 
 def initialize_dvc(
     repo_path: Path,
-    git_user_name:  str = "Colab Bot",
+    git_user_name: str = "Colab Bot",
     git_user_email: str = "colab@bot.local",
 ) -> bool:
     """
@@ -324,15 +318,17 @@ def initialize_dvc(
     logger.info(f"DVC remote '{DVC_REMOTE_NAME}' → {DVC_STORAGE}")
 
     # -------------------------------------------------------------------------
-    # 4. Commit .dvc/config changes if any (so GitHub tracks the remote)
+    # 4. Commit .dvc/config changes if any (FIXED: Check staging area directly)
     # -------------------------------------------------------------------------
     configure_git_identity(repo_path)
 
-    # Stage .dvc/config if it changed
-    _run("git add .dvc/config .dvcignore", cwd=repo_path, silent=True)
+    # Stage .dvc/config explicitly
+    _run("git add .dvc/config", cwd=repo_path, silent=True)
 
-    has_changes = bool(_run_out("git status --porcelain", cwd=repo_path))
-    if has_changes:
+    # Check ONLY staged files (ignores untracked files like __pycache__)
+    staged_files = _run_out("git diff --cached --name-only", cwd=repo_path) or ""
+
+    if ".dvc/config" in staged_files:
         _run(
             "git commit -m 'chore: update DVC remote/cache configuration'",
             cwd=repo_path, timeout=60,
@@ -363,12 +359,12 @@ def dvc_pull(
 ) -> bool:
     """
     Pull DVC-tracked files from Drive local remote.
-    Default targets: ["data/raw"]  — avoids pulling unfinished interim/processed.
+    Default target: ["data/raw/housing.csv"] — matches dvc.yaml ingestion output.
     """
     cwd = repo_path or Path.cwd()
 
-    # Safe default: pull only raw data, not everything
-    effective_targets = targets if targets is not None else ["data/raw"]
+    # 🟢 FIX: Match the exact file tracked by the ingestion stage in dvc.yaml
+    effective_targets = targets if targets is not None else ["data/raw/housing.csv"]
 
     parts = ["dvc", "pull", f"--remote={DVC_REMOTE_NAME}"]
     if force:
@@ -403,22 +399,22 @@ def dvc_status(repo_path: Optional[Path] = None) -> Optional[dict]:
 # =============================================================================
 
 def initialize_environment(
-    repo_name:        str = PROJECT_NAME,
-    repo_owner:       Optional[str] = None,
-    ssh_key_path:     Optional[Union[str, Path]] = None,
-    install_deps:     bool = True,
-    dvc_auto_pull:    bool = True,
-    dvc_pull_targets: Optional[list[str]] = None,   # None → ["data/raw"]
-    dvc_force_pull:   bool = False,
-    git_user_name:    str = "Colab Bot",
-    git_user_email:   str = "colab@bot.local",
+    repo_name: str = PROJECT_NAME,
+    repo_owner: Optional[str] = None,
+    ssh_key_path: Optional[Union[str, Path]] = None,
+    install_deps: bool = True,
+    dvc_auto_pull: bool = True,
+    dvc_pull_targets: Optional[list[str]] = None,
+    dvc_force_pull: bool = False,
+    git_user_name: str = "Colab Bot",
+    git_user_email: str = "colab@bot.local",
 ) -> Path:
     """
     Full Colab session bootstrap.
 
     Usage (every session, top of your notebook):
         from src.utils.colab_setup import initialize_environment
-        repo_path = initialize_environment(repo_owner="ebramrafat653-wq")
+        repo_path = initialize_environment(repo_owner="your_github_username")
 
     Returns:
         Path to /content/<repo_name>
@@ -468,7 +464,7 @@ def initialize_environment(
     # 7. DVC pull
     if dvc_ok and dvc_auto_pull:
         dvc_pull(
-            targets=dvc_pull_targets,   # defaults to ["data/raw"] inside dvc_pull
+            targets=dvc_pull_targets,
             repo_path=repo_path,
             force=dvc_force_pull,
         )
@@ -479,14 +475,14 @@ def initialize_environment(
     os.chdir(repo_path)
 
     # ── Status summary ────────────────────────────────────────────
-    dvc_ready    = (repo_path / ".dvc").exists()
+    dvc_ready = (repo_path / ".dvc").exists()
     kaggle_ready = (Path.home() / ".kaggle" / "kaggle.json").exists()
 
     logger.info("=" * 60)
     logger.info("  ✅ ENVIRONMENT READY")
     logger.info(f"  📍 Working dir : {os.getcwd()}")
-    logger.info(f"  🗂️  DVC         : {'✅ configured' if dvc_ready    else '⚪ not set'}")
-    logger.info(f"  🔐 Kaggle      : {'✅ ready'      if kaggle_ready  else '⚪ not configured'}")
+    logger.info(f"  🗂️  DVC         : {'✅ configured' if dvc_ready else '⚪ not set'}")
+    logger.info(f"  🔐 Kaggle      : {'✅ ready' if kaggle_ready else '⚪ not configured'}")
     logger.info(f"  💾 DVC remote  : {DVC_REMOTE_NAME} → {DVC_STORAGE}")
     logger.info("=" * 60)
 
