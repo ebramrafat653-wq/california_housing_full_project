@@ -283,14 +283,25 @@ class TestFitTransformPipeline:
     def test_raises_on_target_leakage(self, three_feat_splits, mock_config):
         """Ensure pipeline fails fast if target-derived metadata leaks into X."""
         train, val, test = three_feat_splits
+
+        # Inject is_capped into ALL splits to pass schema validation
+        # (the guard will catch it in X_train)
         train_leaked = train.copy()
-        train_leaked["is_capped"] = 0  # Inject forbidden column
-        
+        train_leaked["is_capped"] = 0
+
+        val_leaked = val.copy()
+        val_leaked["is_capped"] = 0
+
+        test_leaked = test.copy()
+        test_leaked["is_capped"] = 0
+
+        # Resolve columns WITHOUT is_capped (as it shouldn't be preprocessed)
         cols = resolve_columns(train_leaked.drop(columns=["is_capped"]), config=mock_config)
         pipeline = build_pipeline(cols)
-        
+
+        # Now, fit_transform_pipeline will check schema (passes), then check X_train (fails)
         with pytest.raises(PipelineError, match="Target leakage detected"):
-            fit_transform_pipeline(pipeline, train_leaked, val, test)
+            fit_transform_pipeline(pipeline, train_leaked, val_leaked, test_leaked)
 
 
 # =============================================================================
