@@ -1,0 +1,200 @@
+schema: '2.0'
+stages:
+  ingestion:
+    cmd: python -m src.data.ingestion --no-dvc
+    deps:
+    - path: configs/data_config.yaml
+      hash: md5
+      md5: d41767d8fd7016f6ce9d1d107af495df
+      size: 7444
+    - path: src/data/data_loader.py
+      hash: md5
+      md5: 98b121d0e8fe1630f257761d33c20d39
+      size: 4086
+    - path: src/data/ingestion.py
+      hash: md5
+      md5: 8abccad6937209663c62a9c885e68e83
+      size: 20326
+    - path: src/utils/paths.py
+      hash: md5
+      md5: 3ff3f66386aca5836df0d9c1bca602ab
+      size: 9797
+    outs:
+    - path: data/raw/housing.csv
+      hash: md5
+      md5: d1c47305887e2252bf1ccbd74ff159a6
+      size: 1423529
+  splitting:
+    cmd: python -m src.data.splitting
+    deps:
+    - path: data/raw/housing.csv
+      hash: md5
+      md5: d1c47305887e2252bf1ccbd74ff159a6
+      size: 1423529
+    - path: src/data/splitting.py
+      hash: md5
+      md5: 0084b271e7217de409f549e2a1b841ea
+      size: 19680
+    params:
+      configs/data_config.yaml:
+        split.random_state: 42
+        split.test_size: 0.15
+        split.val_size: 0.15
+    outs:
+    - path: data/interim
+      hash: md5
+      md5: d2daf578e7662c9b67dcff2fa8d393e8.dir
+      size: 1423801
+      nfiles: 3
+  cleaning:
+    cmd: python -m src.data.cleaning
+    deps:
+    - path: data/interim
+      hash: md5
+      md5: d2daf578e7662c9b67dcff2fa8d393e8.dir
+      size: 1423801
+      nfiles: 3
+    - path: src/data/cleaning.py
+      hash: md5
+      md5: 31cd00ac0fdba14ec5a61bcc79927c64
+      size: 39988
+    params:
+      configs/data_config.yaml:
+        eda_derived.lof:
+          contamination: 0.02
+          n_neighbors: 20
+          features:
+          - median_income
+          - total_rooms
+          - population
+          - households
+          - longitude
+          - latitude
+          n_outliers_detected: 289
+          pct_outliers: 2.0
+          novelty: true
+        eda_derived.missingness:
+          total_bedrooms:
+            impute: true
+            imputation_strategy: median
+            missing_pct: 0.969
+            chi2_pvalue_vs_ocean_proximity: 0.3095
+            mechanism: MCAR
+        eda_derived.target_summary:
+          skewness_raw: 0.982
+          skewness_log1p:
+          pct_capped: 4.727
+          n_capped: 683
+          cap_threshold: 500001.0
+          transform: log1p
+          capped_flag_column: is_capped
+    outs:
+    - path: artifacts/cleaning_artifacts.json
+      hash: md5
+      md5: 372a3d798bacbe14bc4ad9e4cfc3d145
+      size: 433
+    - path: artifacts/lof_model.pkl
+      hash: md5
+      md5: f1224de925699ecae92d82bbf0139569
+      size: 3418666
+    - path: artifacts/lof_scaler.pkl
+      hash: md5
+      md5: 54d145519e19c64d805be917eec9f28a
+      size: 760
+    - path: data/processed/test_clean.csv
+      hash: md5
+      md5: 0c63403c3ccbc98e4b04254bcb29ca6d
+      size: 220191
+    - path: data/processed/train_clean.csv
+      hash: md5
+      md5: 30fc370342b7a8a4ca2bce965f6902b9
+      size: 1025953
+    - path: data/processed/val_clean.csv
+      hash: md5
+      md5: 8eb3ebefc6fc5e39036fee1ef039906f
+      size: 220008
+  engineering:
+    cmd: python -m src.features.engineering
+    deps:
+    - path: data/processed/test_clean.csv
+      hash: md5
+      md5: 0c63403c3ccbc98e4b04254bcb29ca6d
+      size: 220191
+    - path: data/processed/train_clean.csv
+      hash: md5
+      md5: 30fc370342b7a8a4ca2bce965f6902b9
+      size: 1025953
+    - path: data/processed/val_clean.csv
+      hash: md5
+      md5: 8eb3ebefc6fc5e39036fee1ef039906f
+      size: 220008
+    - path: src/features/engineering.py
+      hash: md5
+      md5: c3b4628c62bc40d184e6b2599b753fb7
+      size: 21713
+    params:
+      configs/data_config.yaml:
+        eda_derived.engineered_features:
+          ratios:
+            rooms_per_household: total_rooms / households
+            bedrooms_per_room: total_bedrooms / total_rooms
+            population_per_household: population / households
+          distances:
+            dist_SF:
+              lat: 37.77
+              lon: -122.42
+            dist_LA:
+              lat: 34.05
+              lon: -118.24
+          drop_after_engineering:
+          - total_rooms
+          - total_bedrooms
+          - population
+          - households
+    outs:
+    - path: data/processed/test_feat.csv
+      hash: md5
+      md5: 749a507bc4868a6879b56d217c28a0a0
+      size: 426935
+    - path: data/processed/train_feat.csv
+      hash: md5
+      md5: bdf5405a498b46a50859b2dccab84517
+      size: 1988503
+    - path: data/processed/val_feat.csv
+      hash: md5
+      md5: ceed49f37e6d1d0bfd0978359da0e7b9
+      size: 426091
+  preprocessing:
+    cmd: python -m src.features.pipeline
+    deps:
+    - path: data/processed/train_feat.csv
+      hash: md5
+      md5: bdf5405a498b46a50859b2dccab84517
+      size: 1988503
+    - path: src/features/pipeline.py
+      hash: md5
+      md5: 5745c196a6d660dec83acf8c3181fe58
+      size: 22483
+    params:
+      configs/data_config.yaml:
+        features_config:
+          numerical_standard_scaler:
+          - longitude
+          - latitude
+          - housing_median_age
+          - rooms_per_household
+          - bedrooms_per_room
+          - population_per_household
+          - dist_SF
+          - dist_LA
+          numerical_robust_scaler:
+          - median_income
+          categorical_one_hot:
+          - ocean_proximity
+          passthrough:
+          - lof_outlier
+    outs:
+    - path: artifacts/preprocessing_pipeline.pkl
+      hash: md5
+      md5: 40d48e38c32d35dc54fbc97518be7b29
+      size: 3094
