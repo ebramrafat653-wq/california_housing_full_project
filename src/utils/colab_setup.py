@@ -9,11 +9,11 @@
 #   1. mount_drive()
 #   2. configure_ssh()
 #   3. clone_or_update_repo()
-#   4. setup_drive_symlinks()   ← AFTER clone (repo must exist)
-#   5. install_dependencies()   ← Uses pyproject.toml ONLY
-#   6. initialize_dvc()         ← Always ensures remote + cache are set
-#   7. dvc_pull()               ← Pulls data/raw from Drive remote
-#   8. sys.path + os.chdir()
+#   4. install_dependencies()   ← Uses pyproject.toml ONLY
+#   5. configure_dvc_local()    ← Configure local DVC remote (config.local)
+#   6. sys.path + os.chdir()
+#
+# NOTE: DVC pull and pipeline execution are done manually in notebook cells.
 # =============================================================================
 
 from __future__ import annotations
@@ -33,8 +33,6 @@ from src.utils.paths import (
     DVC_STORAGE,
     IN_COLAB,
     PROJECT_NAME,
-    configure_git_identity,
-    setup_drive_symlinks,
 )
 
 try:
@@ -237,118 +235,66 @@ def install_dependencies(install_dev: bool = True) -> bool:
 
 
 # =============================================================================
-# STEP 5 — DVC INITIALIZATION (ALWAYS CONFIGURE REMOTE + CACHE)
+# STEP 5 — CONFIGURE DVC LOCAL REMOTE (config.local ONLY)
 # =============================================================================
 
-def _ensure_dvc_installed(repo_path: Path) -> bool:
-    """Install DVC (plain, no gdrive extra — remote is local path on Drive)."""
-    try:
-        r = subprocess.run(
-            "which dvc >/dev/null 2>&1 || pip install -q dvc",
-            shell=True, cwd=str(repo_path),
-            capture_output=True, text=True,
-            errors="replace", timeout=180,
-        )
-        return r.returncode == 0
-    except Exception as e:
-        logger.error(f"DVC install failed: {e}")
-        return False
-
-
-def initialize_dvc(
-    repo_path: Path,
-    git_user_name: str = "Colab Bot",
-    git_user_email: str = "colab@bot.local",
-) -> bool:
+def configure_dvc_local(repo_path: Path) -> bool:
     """
-    Ensure DVC is initialized and the Drive remote + cache are configured.
+    Configure DVC local remote settings in .dvc/config.local.
 
-    Unlike the previous version, this function ALWAYS checks/reconfigures
-    the remote and cache in every session, because the Drive remote may
-    have been lost or changed, and we want DVC to use the Drive cache
-    (not the local .dvc/cache) to avoid re-downloading large files.
+    This function:
+    - Checks that .dvc/ directory exists (DVC must be initialized in repo)
+    - Sets local remote name to 'mylocal'
+    - Sets local remote URL to Google Drive path
+    - Does NOT modify .dvc/config (tracked by Git)
+    - Does NOT perform git add/commit/push
+
+    The settings are written to .dvc/config.local which is ignored by Git.
     """
     if not IN_COLAB:
-        logger.debug("Not in Colab — skipping DVC init")
+        logger.debug("Not in Colab — skipping DVC local config")
         return True
 
-    if not _ensure_dvc_installed(repo_path):
-        logger.error("DVC installation failed")
+    dvc_dir = repo_path / ".dvc"
+    if not dvc_dir.exists():
+        logger.error(
+            f"DVC not initialized in {repo_path}. "
+            "Please run 'dvc init' in your repository first."
+        )
         return False
 
-    # -------------------------------------------------------------------------
-    # 1. Initialize DVC if not already done
-    # -------------------------------------------------------------------------
-    if not (repo_path / ".dvc").exists():
-        logger.info("First-time DVC initialization…")
-        if not _run("dvc init", cwd=repo_path, timeout=60):
-            logger.error("dvc init failed")
-            return False
-        logger.info("DVC initialized locally")
-    else:
-        logger.info("DVC already initialized (using existing .dvc/)")
-
-    # -------------------------------------------------------------------------
-    # 2. Always configure DVC cache on Drive (survives session restarts)
-    # -------------------------------------------------------------------------
-    drive_cache = DRIVE_BASE / f"{PROJECT_NAME}_dvc_cache"
-    drive_cache.mkdir(parents=True, exist_ok=True)
-
-    if not _run(f"dvc cache dir '{drive_cache}'", cwd=repo_path):
-        logger.warning("Failed to set DVC cache directory — using default")
-
-    _run("dvc config cache.type symlink", cwd=repo_path, silent=True)
-    _run("dvc config cache.protected true", cwd=repo_path, silent=True)
-    logger.info(f"DVC cache → {drive_cache}")
-
-    # -------------------------------------------------------------------------
-    # 3. Always configure DVC remote (local path on Drive)
-    # -------------------------------------------------------------------------
+    # Ensure DVC storage directory exists on Drive
     DVC_STORAGE.mkdir(parents=True, exist_ok=True)
 
-    # Remove existing remote if it exists, then add fresh
-    _run(f"dvc remote remove {DVC_REMOTE_NAME}", cwd=repo_path, silent=True, timeout=10)
+    # Configure local remote (writes to .dvc/config.local)
+    logger.info(f"Configuring DVC local remote: {DVC_REMOTE_NAME} → {DVC_STORAGE}")
 
+    # Set default remote to 'mylocal'
     if not _run(
-        f"dvc remote add -d -f {DVC_REMOTE_NAME} '{DVC_STORAGE}'",
-        cwd=repo_path, timeout=30,
+        f"dvc config --local core.remote {DVC_REMOTE_NAME}",
+        cwd=repo_path,
+        silent=True,
     ):
-        logger.error("Failed to add DVC remote")
+        logger.error("Failed to set core.remote")
         return False
-    logger.info(f"DVC remote '{DVC_REMOTE_NAME}' → {DVC_STORAGE}")
 
-    # -------------------------------------------------------------------------
-    # 4. Commit .dvc/config changes if any (FIXED: Check staging area directly)
-    # -------------------------------------------------------------------------
-    configure_git_identity(repo_path)
+    # Set remote URL to Google Drive path
+    if not _run(
+        f"dvc config --local remote.{DVC_REMOTE_NAME}.url '{DVC_STORAGE}'",
+        cwd=repo_path,
+        silent=True,
+    ):
+        logger.error("Failed to set remote URL")
+        return False
 
-    # Stage .dvc/config explicitly
-    _run("git add .dvc/config", cwd=repo_path, silent=True)
+    logger.info("✅ DVC local remote configured in .dvc/config.local")
+    logger.info("   (This file is ignored by Git)")
 
-    # Check ONLY staged files (ignores untracked files like __pycache__)
-    staged_files = _run_out("git diff --cached --name-only", cwd=repo_path) or ""
-
-    if ".dvc/config" in staged_files:
-        _run(
-            "git commit -m 'chore: update DVC remote/cache configuration'",
-            cwd=repo_path, timeout=60,
-        )
-        ok = _run("git push", cwd=repo_path, timeout=120)
-        if not ok:
-            ok = _run("git push -u origin HEAD", cwd=repo_path, timeout=120)
-        if ok:
-            logger.info("✅ .dvc/config changes pushed to GitHub")
-        else:
-            logger.error("git push failed — remote config only local")
-    else:
-        logger.info("No changes to .dvc/config")
-
-    logger.info("✅ DVC ready (remote + cache verified)")
     return True
 
 
 # =============================================================================
-# STEP 6 — DVC PULL / STATUS
+# STEP 6 — DVC PULL / STATUS (Manual helpers)
 # =============================================================================
 
 def dvc_pull(
@@ -358,15 +304,18 @@ def dvc_pull(
     timeout: int = 300,
 ) -> bool:
     """
-    Pull DVC-tracked files from Drive local remote.
+    Pull DVC-tracked files from configured remote.
     Default target: ["data/raw/housing.csv"] — matches dvc.yaml ingestion output.
+
+    NOTE: This is a helper function. In notebooks, you can also run:
+        !dvc pull
     """
     cwd = repo_path or Path.cwd()
 
-    # 🟢 FIX: Match the exact file tracked by the ingestion stage in dvc.yaml
+    # Default to pulling raw data only
     effective_targets = targets if targets is not None else ["data/raw/housing.csv"]
 
-    parts = ["dvc", "pull", f"--remote={DVC_REMOTE_NAME}"]
+    parts = ["dvc", "pull"]
     if force:
         parts.append("--force")
     parts.extend(effective_targets)
@@ -403,9 +352,6 @@ def initialize_environment(
     repo_owner: Optional[str] = None,
     ssh_key_path: Optional[Union[str, Path]] = None,
     install_deps: bool = True,
-    dvc_auto_pull: bool = True,
-    dvc_pull_targets: Optional[list[str]] = None,
-    dvc_force_pull: bool = False,
     git_user_name: str = "Colab Bot",
     git_user_email: str = "colab@bot.local",
 ) -> Path:
@@ -418,6 +364,11 @@ def initialize_environment(
 
     Returns:
         Path to /content/<repo_name>
+
+    After this function completes, you should manually run:
+        !dvc pull
+        !dvc status
+        !dvc repro
     """
     if repo_owner is None:
         repo_owner = os.environ.get("GITHUB_REPO_OWNER")
@@ -444,32 +395,16 @@ def initialize_environment(
     if not clone_or_update_repo(repo_owner, repo_name, repo_path, ssh_ok):
         raise RuntimeError("Repository clone/update failed")
 
-    # 4. NOW create Drive symlinks (after repo exists)
-    setup_drive_symlinks()
-    logger.info("Drive symlinks created (data/ and models/ → Drive)")
-
-    # 5. Dependencies (pyproject.toml only)
+    # 4. Dependencies (pyproject.toml only)
     if install_deps:
         # Ensure we are in the repo root before installing so pip finds pyproject.toml
         os.chdir(repo_path)
         install_dependencies(install_dev=True)
 
-    # 6. DVC init (always verifies remote + cache)
-    dvc_ok = initialize_dvc(
-        repo_path,
-        git_user_name=git_user_name,
-        git_user_email=git_user_email,
-    )
+    # 5. Configure DVC local remote (writes to .dvc/config.local)
+    dvc_ok = configure_dvc_local(repo_path)
 
-    # 7. DVC pull
-    if dvc_ok and dvc_auto_pull:
-        dvc_pull(
-            targets=dvc_pull_targets,
-            repo_path=repo_path,
-            force=dvc_force_pull,
-        )
-
-    # 8. Python path + working directory
+    # 6. Python path + working directory
     if str(repo_path) not in sys.path:
         sys.path.insert(0, str(repo_path))
     os.chdir(repo_path)
@@ -484,6 +419,11 @@ def initialize_environment(
     logger.info(f"  🗂️  DVC         : {'✅ configured' if dvc_ready else '⚪ not set'}")
     logger.info(f"  🔐 Kaggle      : {'✅ ready' if kaggle_ready else '⚪ not configured'}")
     logger.info(f"  💾 DVC remote  : {DVC_REMOTE_NAME} → {DVC_STORAGE}")
+    logger.info("")
+    logger.info("  Next steps:")
+    logger.info("    !dvc pull")
+    logger.info("    !dvc status")
+    logger.info("    !dvc repro")
     logger.info("=" * 60)
 
     return repo_path
@@ -495,7 +435,7 @@ __all__ = [
     "configure_ssh",
     "clone_or_update_repo",
     "install_dependencies",
-    "initialize_dvc",
+    "configure_dvc_local",
     "dvc_pull",
     "dvc_status",
 ]
