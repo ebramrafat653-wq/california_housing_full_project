@@ -17,16 +17,17 @@
 #   7. Categorical values   [WARNING]
 #   8. Numeric boundaries   [WARNING]
 #
-# After EDA, a second pass will add:
-#   - Statistical / distributional checks
-#   - Outlier thresholds derived from real distributions
-#   - Business rules discovered during exploration
+# OUTPUT:
+#   - reports/validation/validation_report_{timestamp}.json  (machine-readable)
+#   - reports/validation/validation_report_{timestamp}.md    (human-readable)
 # =============================================================================
 
 from __future__ import annotations
 
+import json
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
@@ -34,6 +35,7 @@ import yaml
 
 from src.data.data_loader import DataLoader
 from src.utils.logger import get_logger
+from src.utils.paths import PROJECT_DIR
 
 logger = get_logger(__name__)
 
@@ -56,6 +58,8 @@ class ValidationReport:
     passed: bool = True
     critical_errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
+    dataset_shape: tuple[int, int] = (0, 0)
 
     def add_critical(self, msg: str) -> None:
         self.critical_errors.append(msg)
@@ -72,8 +76,10 @@ class ValidationReport:
             "VALIDATION REPORT",
             "=" * 60,
             f"Status          : {'PASSED ✓' if self.passed else 'FAILED ✗'}",
+            f"Dataset shape   : {self.dataset_shape[0]:,} rows × {self.dataset_shape[1]} cols",
             f"Critical errors : {len(self.critical_errors)}",
             f"Warnings        : {len(self.warnings)}",
+            f"Timestamp       : {self.timestamp}",
         ]
         if self.critical_errors:
             lines.append("\nCritical Errors:")
@@ -136,7 +142,7 @@ def _check_required_columns(df: pd.DataFrame, cfg: dict, report: ValidationRepor
 def _check_fully_null_columns(df: pd.DataFrame, cfg: dict, report: ValidationReport) -> None:
     """CRITICAL: No column should be 100% null (unless explicitly allowed)."""
     if cfg["validation"].get("allow_fully_null_columns", False):
-        return  # user opted out of this check
+        return
 
     fully_null = [col for col in df.columns if df[col].isna().all()]
     if fully_null:
@@ -151,7 +157,7 @@ def _check_target_column(df: pd.DataFrame, cfg: dict, report: ValidationReport) 
 
     if target not in df.columns:
         report.add_critical(f"Target column '{target}' not found in dataset.")
-        return  # no point checking further
+        return
 
     if not pd.api.types.is_numeric_dtype(df[target]):
         report.add_critical(f"Target column '{target}' must be numeric.")
@@ -172,13 +178,10 @@ def _check_missing_values(df: pd.DataFrame, cfg: dict, report: ValidationReport)
 
     Rules:
       - Columns in allowed_null_columns:
-          * ratio > max_missing_ratio → WARNING (still usable but risky)
-          * ratio <= max_missing_ratio → INFO (expected, within limit)
+          * ratio > max_missing_ratio → WARNING
+          * ratio <= max_missing_ratio → INFO
       - All other columns:
-          * any null → CRITICAL (schema violation — should never happen)
-
-    Note: fully-null columns are already caught by _check_fully_null_columns,
-    so here we only see partial nulls.
+          * any null → CRITICAL
     """
     allowed_null_cols = set(cfg["validation"].get("allowed_null_columns", []))
     max_ratio = cfg["validation"]["max_missing_ratio"]
@@ -209,7 +212,7 @@ def _check_missing_values(df: pd.DataFrame, cfg: dict, report: ValidationReport)
 
 
 def _check_duplicates(df: pd.DataFrame, report: ValidationReport) -> None:
-    """WARNING: Duplicate rows are suspicious (profiling baseline = 0)."""
+    """WARNING: Duplicate rows are suspicious."""
     n_dupes = int(df.duplicated().sum())
     if n_dupes > 0:
         report.add_warning(
@@ -221,12 +224,12 @@ def _check_duplicates(df: pd.DataFrame, report: ValidationReport) -> None:
 
 
 def _check_categorical_values(df: pd.DataFrame, cfg: dict, report: ValidationReport) -> None:
-    """WARNING: Unseen categories signal data drift or upstream schema change."""
+    """WARNING: Unseen categories signal data drift."""
     cat_rules: dict = cfg["validation"].get("categorical_features", {})
 
     for col, allowed_vals in cat_rules.items():
         if col not in df.columns:
-            continue  # already caught by _check_required_columns
+            continue
 
         allowed_set = set(allowed_vals)
         actual_set = set(df[col].dropna().unique())
@@ -242,11 +245,7 @@ def _check_categorical_values(df: pd.DataFrame, cfg: dict, report: ValidationRep
 
 
 def _check_numeric_boundaries(df: pd.DataFrame, cfg: dict, report: ValidationReport) -> None:
-    """
-    WARNING: Values outside profiling-derived min/max bounds.
-    These are hard limits from profiling (absolute min/max), NOT outlier thresholds.
-    Outlier thresholds will be added post-EDA using IQR / z-score analysis.
-    """
+    """WARNING: Values outside profiling-derived min/max bounds."""
     boundaries: dict = cfg["validation"].get("numeric_boundaries", {})
 
     for col, bounds in boundaries.items():
@@ -263,8 +262,7 @@ def _check_numeric_boundaries(df: pd.DataFrame, cfg: dict, report: ValidationRep
             if n_below > 0:
                 col_ok = False
                 report.add_warning(
-                    f"'{col}': {n_below} value(s) below expected min ({lo}). "
-                    "Possible data drift or corruption."
+                    f"'{col}': {n_below} value(s) below expected min ({lo})."
                 )
 
         if hi is not None:
@@ -272,12 +270,113 @@ def _check_numeric_boundaries(df: pd.DataFrame, cfg: dict, report: ValidationRep
             if n_above > 0:
                 col_ok = False
                 report.add_warning(
-                    f"'{col}': {n_above} value(s) above expected max ({hi}). "
-                    "Possible data drift or corruption."
+                    f"'{col}': {n_above} value(s) above expected max ({hi})."
                 )
 
         if col_ok:
             logger.info(f"'{col}' numeric boundaries OK ✓")
+
+
+# ---------------------------------------------------------------------------
+# Export Validation Report (JSON + Markdown)
+# ---------------------------------------------------------------------------
+
+def export_validation_report(
+    report: ValidationReport,
+    output_dir: str | Path | None = None,
+) -> tuple[Path, Path]:
+    """
+    Export validation report to both JSON (machine-readable) and Markdown (human-readable).
+
+    Parameters
+    ----------
+    report     : ValidationReport instance
+    output_dir : Directory to save reports (default: reports/validation/)
+
+    Returns
+    -------
+    tuple[Path, Path] : (json_path, markdown_path)
+    """
+    output_dir = Path(output_dir) if output_dir else PROJECT_DIR / "reports" / "validation"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Generate timestamp-based filename
+    timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    json_path = output_dir / f"validation_report_{timestamp_str}.json"
+    md_path = output_dir / f"validation_report_{timestamp_str}.md"
+
+    # ── Export JSON ─────────────────────────────────────────────────────────
+    report_dict = {
+        "passed": report.passed,
+        "timestamp": report.timestamp,
+        "dataset_shape": {
+            "rows": report.dataset_shape[0],
+            "columns": report.dataset_shape[1],
+        },
+        "critical_errors": report.critical_errors,
+        "warnings": report.warnings,
+        "summary": {
+            "n_critical": len(report.critical_errors),
+            "n_warnings": len(report.warnings),
+        },
+    }
+
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(report_dict, f, indent=2, ensure_ascii=False)
+
+    logger.info(f"Validation report (JSON) saved → {json_path}")
+
+    # ── Export Markdown ─────────────────────────────────────────────────────
+    md_lines = [
+        "# Data Validation Report",
+        "",
+        f"**Timestamp**: {report.timestamp}",
+        f"**Status**: {'✅ PASSED' if report.passed else '❌ FAILED'}",
+        "",
+        "## Dataset Summary",
+        "",
+        f"- **Rows**: {report.dataset_shape[0]:,}",
+        f"- **Columns**: {report.dataset_shape[1]}",
+        "",
+        "## Summary Statistics",
+        "",
+        f"- **Critical Errors**: {len(report.critical_errors)}",
+        f"- **Warnings**: {len(report.warnings)}",
+        "",
+    ]
+
+    if report.critical_errors:
+        md_lines.extend([
+            "## ❌ Critical Errors",
+            "",
+        ])
+        for i, err in enumerate(report.critical_errors, 1):
+            md_lines.append(f"{i}. {err}")
+        md_lines.append("")
+
+    if report.warnings:
+        md_lines.extend([
+            "## ⚠️ Warnings",
+            "",
+        ])
+        for i, warn in enumerate(report.warnings, 1):
+            md_lines.append(f"{i}. {warn}")
+        md_lines.append("")
+
+    if report.passed and not report.critical_errors and not report.warnings:
+        md_lines.extend([
+            "## ✅ All Checks Passed",
+            "",
+            "No critical errors or warnings detected.",
+            "",
+        ])
+
+    with open(md_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(md_lines))
+
+    logger.info(f"Validation report (Markdown) saved → {md_path}")
+
+    return json_path, md_path
 
 
 # ---------------------------------------------------------------------------
@@ -288,6 +387,8 @@ def validate_dataframe(
     df: pd.DataFrame,
     config_path: str | Path = "configs/data_config.yaml",
     raise_on_failure: bool = True,
+    export_report: bool = True,
+    output_dir: str | Path | None = None,
 ) -> ValidationReport:
     """
     Run all preliminary validation checks against `df`.
@@ -297,7 +398,8 @@ def validate_dataframe(
     df               : DataFrame returned by ingestion.py → run_ingestion()
     config_path      : Path to data_config.yaml
     raise_on_failure : If True (default), raises ValidationError on any critical failure.
-                       Set False only in notebooks for exploratory inspection.
+    export_report    : If True (default), exports report to JSON + Markdown.
+    output_dir       : Directory to save reports (default: reports/validation/)
 
     Returns
     -------
@@ -307,15 +409,6 @@ def validate_dataframe(
     ------
     ValidationError   if any CRITICAL check fails and raise_on_failure=True.
     FileNotFoundError if config_path does not exist.
-
-    Usage
-    -----
-        from src.data.ingestion import run_ingestion
-        from src.data.validation import validate_dataframe
-
-        report = run_ingestion()          # returns DownloadReport
-        df     = pd.read_csv(...)         # or however you load after ingestion
-        report = validate_dataframe(df)   # raises on critical failure
     """
     logger.info("=" * 60)
     logger.info("  Starting data validation (preliminary)")
@@ -323,27 +416,33 @@ def validate_dataframe(
 
     cfg = _load_config(config_path)
     report = ValidationReport()
+    report.dataset_shape = df.shape
 
-    # ── CRITICAL checks — stop adding column-level checks if schema is broken ──
+    # ── CRITICAL checks ─────────────────────────────────────────────────────
     _check_not_empty(df, cfg, report)
 
     if not report.critical_errors:
-        # Only meaningful if we have rows and columns
         _check_required_columns(df, cfg, report)
         _check_fully_null_columns(df, cfg, report)
 
     if not report.critical_errors:
-        # Only meaningful if all required columns are present
         _check_target_column(df, cfg, report)
         _check_missing_values(df, cfg, report)
 
-    # ── WARNING checks — always run (independent of schema) ──────────────────
+    # ── WARNING checks ──────────────────────────────────────────────────────
     _check_duplicates(df, report)
     _check_categorical_values(df, cfg, report)
     _check_numeric_boundaries(df, cfg, report)
 
-    # ── Summary ──────────────────────────────────────────────────────────────
+    # ── Summary ─────────────────────────────────────────────────────────────
     logger.info("\n" + report.summary())
+
+    # ── Export report ───────────────────────────────────────────────────────
+    if export_report:
+        try:
+            json_path, md_path = export_validation_report(report, output_dir)
+        except Exception as e:
+            logger.error(f"Failed to export validation report: {e}")
 
     if not report.passed and raise_on_failure:
         raise ValidationError(
@@ -378,4 +477,5 @@ __all__ = [
     "ValidationError",
     "ValidationReport",
     "validate_dataframe",
+    "export_validation_report",
 ]
