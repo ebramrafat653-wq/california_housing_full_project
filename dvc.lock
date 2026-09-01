@@ -17,8 +17,8 @@ stages:
       size: 20326
     - path: src/utils/paths.py
       hash: md5
-      md5: 3ff3f66386aca5836df0d9c1bca602ab
-      size: 9797
+      md5: 86ce75fe268fddc8f76cc08d9aa5c6c4
+      size: 7610
     outs:
     - path: data/raw/housing.csv
       hash: md5
@@ -198,3 +198,63 @@ stages:
       hash: md5
       md5: 40d48e38c32d35dc54fbc97518be7b29
       size: 3094
+  validation:
+    cmd: python -m src.data.validation
+    deps:
+    - path: data/raw/housing.csv
+      hash: md5
+      md5: d1c47305887e2252bf1ccbd74ff159a6
+      size: 1423529
+    - path: src/data/validation.py
+      hash: md5
+      md5: caec523b7b571195af670161949b071a
+      size: 17108
+    params:
+      configs/data_config.yaml:
+        validation:
+          max_missing_ratio: 0.3
+          min_rows: 100
+          min_columns: 5
+          allow_fully_null_columns: false
+          required_columns:
+          - longitude
+          - latitude
+          - housing_median_age
+          - total_rooms
+          - total_bedrooms
+          - population
+          - households
+          - median_income
+          - ocean_proximity
+          - median_house_value
+          allowed_null_columns:
+          - total_bedrooms
+          categorical_features:
+            ocean_proximity:
+            - NEAR BAY
+            - <1H OCEAN
+            - INLAND
+            - NEAR OCEAN
+            - ISLAND
+          numeric_boundaries:
+            longitude:
+              min: -124.35
+              max: -114.0
+            latitude:
+              min: 32.0
+              max: 42.0
+            housing_median_age:
+              min: 1.0
+              max: 52.0
+            median_house_value:
+              min: 14999.0
+              max: 500001.0
+            median_income:
+              min: 0.0
+              max: 16.0
+    outs:
+    - path: reports/validation
+      hash: md5
+      md5: 8b42815cf4bbe53dce319902c74954e7.dir
+      size: 516
+      nfiles: 2
