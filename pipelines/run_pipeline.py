@@ -482,19 +482,29 @@ def execute_full_pipeline() -> None:
                     )
 
                 # -------------------------------------------------------------
-                # Native sklearn MLflow model
+                # Native sklearn MLflow model (with skops serialization)
                 # -------------------------------------------------------------
 
+                # ✅ FIX: Use skops with trusted types to avoid MlflowException
                 mlflow.sklearn.log_model(
                     sk_model=fitted_pipeline,
-                    artifact_path=(
-                        "final_pipeline_model"
-                    ),
+                    artifact_path="final_pipeline_model",
+                    serialization_format="skops",
+                    skops_trusted_types=[
+                        "numpy.dtype",
+                        "sklearn.compose._column_transformer._RemainderColsList",
+                        "sklearn.metrics._dist_metrics.EuclideanDistance64",
+                        "sklearn.neighbors._kd_tree.KDTree",
+                        "src.features.engineering.FeatureConfig",
+                        "src.features.engineering.FeatureEngineer",
+                        "src.features.pipeline.DataFrameImputer",
+                        "src.features.pipeline.LOFTransformer",
+                    ],
                 )
 
                 logger.info(
                     "Final sklearn pipeline "
-                    "logged to MLflow."
+                    "logged to MLflow (with skops)."
                 )
 
         # =====================================================================
