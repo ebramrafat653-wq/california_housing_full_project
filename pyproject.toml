@@ -61,6 +61,13 @@ dependencies = [
     # Data source
     "kaggle>=1.5.16",
     
+    # Experiment tracking
+    "mlflow>=2.8.0",
+    
+    # Web API (for serving the model)
+    "fastapi>=0.104.0",
+    "uvicorn>=0.24.0",
+    
     # Testing
     "pytest>=7.4.0",
 ]
@@ -166,6 +173,7 @@ module = [
     "sklearn.*",
     "yaml.*",
     "kaggle.*",
+    "mlflow.*",
 ]
 ignore_missing_imports = true
 
