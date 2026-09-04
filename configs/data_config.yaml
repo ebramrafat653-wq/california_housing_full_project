@@ -1,48 +1,110 @@
 # =============================================================================
 # California Housing Project — Data Configuration
-# Compatible with: Linux, macOS, Windows, Google Colab
-# Used by: src/data/ingestion.py, src/data/validation.py, src/data/cleaning.py,
-#          src/utils/colab_setup.py
+# =============================================================================
 #
-# UPDATED AFTER EDA (notebooks/03_eda.ipynb) — train.csv, 14,448 rows
+# RESPONSIBILITY
+# --------------
+# Configuration for:
+#   - Dataset ingestion
+#   - Data validation
+#   - EDA-derived decisions
+#   - Data splitting
+#   - Feature engineering
+#   - CV-safe preprocessing
+#   - DVC metadata
+#
+# USED BY
+# -------
+#   src/data/ingestion.py
+#   src/data/validation.py
+#   src/data/cleaning.py
+#   src/features/engineering.py
+#   src/features/pipeline.py
+#   src/utils/colab_setup.py
+#
+# IMPORTANT
+# ---------
+# Learned preprocessing is NOT performed in the data layer.
+#
+# Learned operations remain inside the sklearn training pipeline:
+#   - Imputation
+#   - LOF
+#   - Scaling
+#   - Encoding
+#   - Model fitting
+#
 # =============================================================================
 
-# -----------------------------------------------------------------------------
+
+# =============================================================================
 # DATASET SOURCE
-# -----------------------------------------------------------------------------
+# =============================================================================
+
 dataset:
+
   name: "california_housing"
+
   source: "kaggle"
+
   kaggle_id: "camnugent/california-housing-prices"
 
-  # Files expected after download/unzip (used by verify_download_integrity)
+  # Files expected after download/unzip.
   expected_files:
     - "housing.csv"
 
-  # Options passed to pd.read_csv
+  # Options passed to pandas.read_csv().
   encoding: "utf-8"
+
   csv_options:
     sep: ","
     header: 0
     index_col: null
-    na_values: ["?", "NA", "N/A", "null", "None"]
+    na_values:
+      - "?"
+      - "NA"
+      - "N/A"
+      - "null"
+      - "None"
 
-# -----------------------------------------------------------------------------
+
+# =============================================================================
 # PROJECT METADATA
-# -----------------------------------------------------------------------------
-project:
-  name: "california_housing_full_project"
-  target: "median_house_value"
-  task_type: "regression"
-  description: "Predict median house value in California districts using census data"
+# =============================================================================
 
-# -----------------------------------------------------------------------------
-# DATA VALIDATION RULES (Phase 1 — from profiling, used by validation.py)
-# -----------------------------------------------------------------------------
+project:
+
+  name: "california_housing_full_project"
+
+  target: "median_house_value"
+
+  task_type: "regression"
+
+  description: >
+    Predict median house value in California districts using census data.
+
+
+# =============================================================================
+# DATA VALIDATION RULES
+# =============================================================================
+#
+# Phase 1:
+#   - Structural validation
+#   - Missing-value contract
+#   - Category validation
+#   - Hard data boundaries
+#
+# These are DATA QUALITY rules, not outlier-removal rules.
+#
+# =============================================================================
+
 validation:
+
   max_missing_ratio: 0.3
+
   min_rows: 100
+
   min_columns: 5
+
   allow_fully_null_columns: false
 
   required_columns:
@@ -57,12 +119,17 @@ validation:
     - "ocean_proximity"
     - "median_house_value"
 
-  # 1. Null Rules: Only these columns are allowed to have missing values
+  # Only this column is allowed to contain missing values.
+  #
+  # Important:
+  # validation.py checks this contract.
+  # cleaning.py does NOT impute the values.
+  # Imputation is performed inside the CV-safe sklearn pipeline.
   allowed_null_columns:
     - "total_bedrooms"
 
-  # 2. Categorical Rules: Strict adherence to known categories
   categorical_features:
+
     ocean_proximity:
       - "NEAR BAY"
       - "<1H OCEAN"
@@ -70,96 +137,191 @@ validation:
       - "NEAR OCEAN"
       - "ISLAND"
 
-  # 3. Numeric Boundaries: Catch data drift or corrupted inputs
-  # Extracted from the profiling min/max bounds (hard limits, not outlier detection)
+  # Hard boundaries used to detect invalid/corrupted data.
+  #
+  # These are NOT IQR outlier boundaries.
   numeric_boundaries:
+
     longitude:
       min: -124.35
       max: -114.0
+
     latitude:
       min: 32.0
       max: 42.0
+
     housing_median_age:
       min: 1.0
-      max: 52.0  # Note: Capped value
+      max: 52.0
+      # Known capped value.
+
     median_house_value:
       min: 14999.0
-      max: 500001.0 # Note: Capped value
+      max: 500001.0
+      # Known capped value.
+
     median_income:
       min: 0.0
       max: 16.0
 
-# -----------------------------------------------------------------------------
-# EDA-DERIVED VALUES (Phase 2 — from notebooks/03_eda.ipynb on train.csv only)
-# These feed validation.py phase 2, cleaning.py, and feature_engineering.py.
-# Source: train set, 14,448 rows. Re-run EDA and update this section if the
-# split or raw data changes significantly.
-# -----------------------------------------------------------------------------
+
+# =============================================================================
+# EDA-DERIVED CONFIGURATION
+# =============================================================================
+#
+# Derived from the EDA performed on the training split.
+#
+# IMPORTANT
+# ---------
+# These values represent DATA/EDA decisions.
+# They must not be confused with fitted preprocessing artifacts.
+#
+# =============================================================================
+
 eda_derived:
 
-  # --- Missingness analysis (Section 3) ---------------------------------------
-  # Welch t-test (numeric) + chi-square (categorical) against total_bedrooms.isnull()
-  missingness:
-    total_bedrooms:
-      impute: true                     
-      imputation_strategy: "median"    
-      missing_pct: 0.969
-      chi2_pvalue_vs_ocean_proximity: 0.3095
-      mechanism: "MCAR"  
+  # ---------------------------------------------------------------------------
+  # Missingness analysis
+  # ---------------------------------------------------------------------------
 
-  # --- Target distribution (Section 4) -----------------------------------------
+  missingness:
+
+    total_bedrooms:
+
+      impute: true
+
+      imputation_strategy: "median"
+
+      missing_pct: 0.969
+
+      chi2_pvalue_vs_ocean_proximity: 0.3095
+
+      mechanism: "MCAR"
+
+
+  # ---------------------------------------------------------------------------
+  # Target distribution
+  # ---------------------------------------------------------------------------
+  #
+  # log1p is currently an EDA-derived candidate decision.
+  #
+  # IMPORTANT:
+  # The target is NOT transformed by the current training pipeline.
+  #
+  # Therefore:
+  #   transform_candidate = "log1p"
+  #   applied_to_target = false
+  #
+  # This avoids ambiguity for reviewers and prevents accidental target
+  # transformation simply because it is recorded in configuration.
+  # ---------------------------------------------------------------------------
+
   target_summary:
+
     skewness_raw: 0.982
-    skewness_log1p: null             
+
+    skewness_log1p: null
+
     pct_capped: 4.727
+
     n_capped: 683
+
     cap_threshold: 500001.0
-    transform: "log1p"
+
+    transform_candidate: "log1p"
+
+    applied_to_target: false
+
     capped_flag_column: "is_capped"
 
-  # --- IQR outlier boundaries (Section 8) ----------------------------------------
-  # Q1 - 1.5*IQR / Q3 + 1.5*IQR on train set. Used for soft outlier flags
-  # and validation.py phase 2 — NOT for dropping rows.
+
+  # ---------------------------------------------------------------------------
+  # IQR analysis
+  # ---------------------------------------------------------------------------
+  #
+  # These values are diagnostic/monitoring boundaries.
+  #
+  # They are NOT used to drop observations.
+  #
+  # ---------------------------------------------------------------------------
+
   iqr_bounds:
+
     longitude:
       lower: -127.51
       upper: -112.31
+
     latitude:
       lower: 28.245
       upper: 43.405
+
     housing_median_age:
       lower: -10.5
       upper: 65.5
+
     total_rooms:
       lower: -1098.375
       upper: 5686.625
+
     total_bedrooms:
       lower: -232.5
       upper: 1171.5
+
     population:
       lower: -622.375
       upper: 3130.625
+
     households:
       lower: -209.5
       upper: 1090.5
+
     median_income:
       lower: -0.7188
       upper: 8.0312
 
-  # --- Multicollinearity check (Section 7) ---------------------------------------
-  # VIF on engineered ratios + median_income. All < 10 -> no feature dropped.
+
+  # ---------------------------------------------------------------------------
+  # Multicollinearity
+  # ---------------------------------------------------------------------------
+
   vif_scores:
+
     rooms_per_household: 5.459
+
     bedrooms_per_room: 3.476
+
     population_per_household: 1.074
+
     median_income: 4.564
+
   vif_threshold_drop: 10.0
+
   vif_threshold_watch: 5.0
 
-  # --- LOF multivariate outlier detection (Section 8) ------------------------------
+
+  # ---------------------------------------------------------------------------
+  # LOF configuration
+  # ---------------------------------------------------------------------------
+  #
+  # LOF is a LEARNED transformation.
+  #
+  # Therefore this configuration is consumed by the sklearn CV pipeline.
+  #
+  # LOF is fitted separately inside each CV training fold.
+  #
+  # novelty=true is required because the fitted detector is later used
+  # to transform validation/test/new observations.
+  #
+  # ---------------------------------------------------------------------------
+
   lof:
+
     contamination: 0.02
+
     n_neighbors: 20
+
+    novelty: true
+
     features:
       - "median_income"
       - "total_rooms"
@@ -167,73 +329,168 @@ eda_derived:
       - "households"
       - "longitude"
       - "latitude"
-    n_outliers_detected: 289
-    pct_outliers: 2.00
-    novelty: true                   
 
-  # --- Feature transformation decisions (-> cleaning.py) ---------------------------
+    # EDA reference only.
+    n_outliers_detected: 289
+
+    pct_outliers: 2.00
+
+
+  # ---------------------------------------------------------------------------
+  # Feature transformation decisions
+  # ---------------------------------------------------------------------------
+  #
+  # These describe EDA decisions.
+  #
+  # The actual numerical imputation is performed by pipeline.py inside
+  # the sklearn Pipeline.
+  #
+  # log1p_columns are retained as EDA metadata only.
+  # They are NOT applied by the current training pipeline.
+  #
+  # ---------------------------------------------------------------------------
+
   log1p_columns:
     - "total_rooms"
     - "total_bedrooms"
     - "population"
     - "households"
-  no_transform_columns:
-    - "median_income"               
 
-  # --- Feature engineering candidates (-> feature_engineering.py) ------------------
+  no_transform_columns:
+    - "median_income"
+
+
+  # ---------------------------------------------------------------------------
+  # Deterministic feature engineering
+  # ---------------------------------------------------------------------------
+  #
+  # Implemented by:
+  #   src/features/engineering.py
+  #
+  # The same FeatureEngineer transformer is used inside the CV-safe
+  # training pipeline.
+  #
+  # ---------------------------------------------------------------------------
+
   engineered_features:
+
     ratios:
-      rooms_per_household: "total_rooms / households"
-      bedrooms_per_room: "total_bedrooms / total_rooms"
-      population_per_household: "population / households"
+
+      rooms_per_household:
+        "total_rooms / households"
+
+      bedrooms_per_room:
+        "total_bedrooms / total_rooms"
+
+      population_per_household:
+        "population / households"
+
     distances:
-      dist_SF: {lat: 37.77, lon: -122.42}
-      dist_LA: {lat: 34.05, lon: -118.24}
+
+      dist_SF:
+        lat: 37.77
+        lon: -122.42
+
+      dist_LA:
+        lat: 34.05
+        lon: -118.24
+
+    # Raw columns are used for engineering and removed afterward.
+    #
+    # They remain available to LOF because LOF executes BEFORE
+    # FeatureEngineer in the training pipeline.
     drop_after_engineering:
       - "total_rooms"
       - "total_bedrooms"
       - "population"
       - "households"
 
-# -----------------------------------------------------------------------------
-# TRAIN/VAL/TEST SPLIT
-# -----------------------------------------------------------------------------
+
+# =============================================================================
+# TRAIN / VALIDATION / TEST SPLIT
+# =============================================================================
+
 split:
+
   val_size: 0.15
+
   test_size: 0.15
+
   random_state: 42
+
   shuffle: true
-  strategy: "stratified"             
+
+  strategy: "stratified"
+
+  # Stratification bins are based on the target distribution.
   n_strata_bins: 5
 
-# -----------------------------------------------------------------------------
+
+# =============================================================================
 # DVC CONFIGURATION
-# -----------------------------------------------------------------------------
+# =============================================================================
+#
+# This section is project metadata/configuration consumed by project utilities.
+#
+# DVC itself is orchestrated through dvc.yaml.
+#
+# =============================================================================
+
 dvc:
+
   enabled: true
+
   remote:
+
     name: "mylocal"
+
     type: "local"
+
     default: true
+
   tracked_paths:
     - "data/raw"
     - "data/interim"
     - "data/processed"
     - "models"
+
   auto_pull:
+
     enabled: true
+
     force: false
+
     targets:
       - "data/raw"
-  cache:
-    type: "symlink"
-    protected: 
 
-# -----------------------------------------------------------------------------
-# FEATURES CONFIGURATION (for preprocessing.py)
-# -----------------------------------------------------------------------------
+  cache:
+
+    type: "symlink"
+
+    protected: true
+
+
+# =============================================================================
+# FEATURES CONFIGURATION
+# =============================================================================
+#
+# These columns represent the schema AFTER:
+#
+#   DataFrameImputer
+#        ↓
+#   LOF
+#        ↓
+#   FeatureEngineer
+#
+# Therefore engineered columns are intentionally listed here even though
+# they do not exist in train_clean.csv.
+#
+# =============================================================================
+
 features_config:
+
   numerical_standard_scaler:
+
     - "longitude"
     - "latitude"
     - "housing_median_age"
@@ -242,9 +499,16 @@ features_config:
     - "population_per_household"
     - "dist_SF"
     - "dist_LA"
+
   numerical_robust_scaler:
+
     - "median_income"
+
   categorical_one_hot:
+
     - "ocean_proximity"
+
+  # LOF output generated inside the sklearn pipeline.
   passthrough:
+
     - "lof_outlier"
