@@ -1,0 +1,476 @@
+# =============================================================================
+# California Housing Project — Model Training Configuration
+# =============================================================================
+#
+# RESPONSIBILITY
+# --------------
+# Define:
+#   - Project/model metadata
+#   - Dataset paths
+#   - Cross-validation
+#   - Candidate models
+#   - Model selection
+#   - Hyperparameter tuning
+#   - Search spaces
+#   - Final training strategy
+#   - Evaluation
+#   - MLflow tracking
+#   - Final artifacts/reports
+#
+# IMPORTANT
+# ---------
+# Preprocessing is NOT defined here.
+#
+# Preprocessing ownership:
+#
+#   src/features/pipeline.py
+#
+# Test data must NEVER participate in:
+#   - model benchmarking
+#   - model selection
+#   - hyperparameter tuning
+#   - final model fitting
+#
+# =============================================================================
+
+
+# =============================================================================
+# PROJECT
+# =============================================================================
+
+project:
+
+  name: "california_housing_regression"
+
+  task: "regression"
+
+  target: "median_house_value"
+
+  random_state: 42
+
+
+# =============================================================================
+# DATA
+# =============================================================================
+#
+# The training pipeline consumes CLEAN datasets.
+#
+# Feature engineering is performed again inside the CV-safe sklearn Pipeline.
+#
+# train_feat.csv / val_feat.csv / test_feat.csv are lineage/inspection outputs
+# from the deterministic engineering stage and are NOT model-training inputs.
+#
+# =============================================================================
+
+data:
+
+  train_path: "data/processed/train_clean.csv"
+
+  validation_path: "data/processed/val_clean.csv"
+
+  test_path: "data/processed/test_clean.csv"
+
+
+# =============================================================================
+# CROSS VALIDATION
+# =============================================================================
+
+cross_validation:
+
+  strategy: "kfold"
+
+  n_splits: 5
+
+  shuffle: true
+
+  random_state: 42
+
+  # Benchmarking executes one CV workload at a time.
+  #
+  # Candidate tree models use n_jobs=1 to avoid nested parallelism.
+  n_jobs: 1
+
+  scoring:
+
+    primary: "neg_root_mean_squared_error"
+
+    additional:
+      - "neg_mean_absolute_error"
+      - "r2"
+
+
+# =============================================================================
+# MODEL SELECTION
+# =============================================================================
+
+model_selection:
+
+  # This metric controls candidate model ranking.
+  primary_metric: "neg_root_mean_squared_error"
+
+  # Human-readable optimization direction.
+  #
+  # RMSE is minimized.
+  optimization_direction: "minimize"
+
+
+# =============================================================================
+# CANDIDATE MODELS
+# =============================================================================
+
+models:
+
+  # ---------------------------------------------------------------------------
+  # Linear Regression
+  # ---------------------------------------------------------------------------
+
+  linear_regression:
+
+    enabled: true
+
+    class: "sklearn.linear_model.LinearRegression"
+
+    params: {}
+
+
+  # ---------------------------------------------------------------------------
+  # Ridge Regression
+  # ---------------------------------------------------------------------------
+
+  ridge:
+
+    enabled: true
+
+    class: "sklearn.linear_model.Ridge"
+
+    params:
+
+      alpha: 1.0
+
+      random_state: 42
+
+
+  # ---------------------------------------------------------------------------
+  # Random Forest
+  # ---------------------------------------------------------------------------
+  #
+  # n_jobs=1 is intentional.
+  #
+  # This allows outer CV/tuning parallelism to be controlled safely without
+  # spawning nested worker pools inside every Random Forest estimator.
+  #
+  # ---------------------------------------------------------------------------
+
+  random_forest:
+
+    enabled: true
+
+    class: "sklearn.ensemble.RandomForestRegressor"
+
+    params:
+
+      n_estimators: 300
+
+      max_depth: null
+
+      min_samples_split: 2
+
+      min_samples_leaf: 1
+
+      max_features: 1.0
+
+      n_jobs: 1
+
+      random_state: 42
+
+
+  # ---------------------------------------------------------------------------
+  # Gradient Boosting
+  # ---------------------------------------------------------------------------
+
+  gradient_boosting:
+
+    enabled: true
+
+    class: "sklearn.ensemble.GradientBoostingRegressor"
+
+    params:
+
+      n_estimators: 300
+
+      learning_rate: 0.05
+
+      max_depth: 3
+
+      min_samples_split: 2
+
+      min_samples_leaf: 1
+
+      subsample: 1.0
+
+      random_state: 42
+
+
+# =============================================================================
+# HYPERPARAMETER TUNING
+# =============================================================================
+#
+# Tuning operates ONLY on the training set.
+#
+# RandomizedSearchCV:
+#
+#   Train
+#      ↓
+#   CV folds
+#      ↓
+#   Best hyperparameters
+#
+# It does NOT use validation or test data.
+#
+# refit=false is intentional because the actual final fit is performed later
+# by training.py on:
+#
+#   Train + Validation
+#
+# =============================================================================
+
+tuning:
+
+  enabled: true
+
+  method: "randomized_search"
+
+  n_iter: 30
+
+  scoring: "neg_root_mean_squared_error"
+
+  cv:
+
+    strategy: "kfold"
+
+    n_splits: 5
+
+    shuffle: true
+
+    random_state: 42
+
+  # Parallelize RandomizedSearchCV.
+  #
+  # Individual tree estimators use n_jobs=1 to prevent nested oversubscription.
+  n_jobs: -1
+
+  random_state: 42
+
+  # Do not refit the best estimator on Train here.
+  #
+  # Final refit happens in training.py using Train + Validation.
+  refit: false
+
+
+# =============================================================================
+# HYPERPARAMETER SEARCH SPACES
+# =============================================================================
+#
+# Parameter names use the sklearn Pipeline namespace:
+#
+#     model__<parameter>
+#
+# because the estimator is located at:
+#
+#     Pipeline(..., ("model", estimator))
+#
+# =============================================================================
+
+search_spaces:
+
+  # ---------------------------------------------------------------------------
+  # Ridge
+  # ---------------------------------------------------------------------------
+
+  ridge:
+
+    model__alpha:
+      - 0.01
+      - 0.1
+      - 1.0
+      - 10.0
+      - 100.0
+
+
+  # ---------------------------------------------------------------------------
+  # Random Forest
+  # ---------------------------------------------------------------------------
+
+  random_forest:
+
+    model__n_estimators:
+      - 200
+      - 300
+      - 500
+
+    model__max_depth:
+      - null
+      - 10
+      - 20
+      - 30
+
+    model__min_samples_split:
+      - 2
+      - 5
+      - 10
+
+    model__min_samples_leaf:
+      - 1
+      - 2
+      - 4
+
+    model__max_features:
+      - 0.5
+      - 0.75
+      - 1.0
+
+
+  # ---------------------------------------------------------------------------
+  # Gradient Boosting
+  # ---------------------------------------------------------------------------
+
+  gradient_boosting:
+
+    model__n_estimators:
+      - 100
+      - 200
+      - 300
+      - 500
+
+    model__learning_rate:
+      - 0.01
+      - 0.03
+      - 0.05
+      - 0.1
+
+    model__max_depth:
+      - 2
+      - 3
+      - 4
+      - 5
+
+    model__min_samples_split:
+      - 2
+      - 5
+      - 10
+
+    model__min_samples_leaf:
+      - 1
+      - 2
+      - 4
+
+    model__subsample:
+      - 0.7
+      - 0.85
+      - 1.0
+
+
+# =============================================================================
+# FINAL TRAINING
+# =============================================================================
+#
+# Final training occurs ONLY after:
+#
+#   1. Candidate model selection
+#   2. Hyperparameter tuning
+#
+# Then:
+#
+#   Train + Validation
+#          ↓
+#      Final Fit
+#
+# Test remains untouched.
+#
+# =============================================================================
+
+final_training:
+
+  strategy: "train_plus_validation"
+
+  use_test_for_training: false
+
+
+# =============================================================================
+# EVALUATION
+# =============================================================================
+
+evaluation:
+
+  metrics:
+    - "rmse"
+    - "mae"
+    - "r2"
+
+  primary_metric: "rmse"
+
+  save_predictions: true
+
+
+# =============================================================================
+# MLFLOW
+# =============================================================================
+#
+# MLflow is an external tracking layer.
+#
+# src/models/ remains MLflow-independent.
+#
+# Integration is performed by:
+#
+#   pipelines/run_pipeline.py
+#
+# =============================================================================
+
+mlflow:
+
+  enabled: true
+
+  experiment_name: "california_housing_regression"
+
+  tracking_uri: "file:./mlruns"
+
+  log_model: true
+
+  log_params: true
+
+  log_metrics: true
+
+  log_tags: true
+
+
+# =============================================================================
+# ARTIFACTS
+# =============================================================================
+
+artifacts:
+
+  output_dir: "artifacts"
+
+  final_model:
+
+    path: "artifacts/final_model_pipeline.pkl"
+
+  reports:
+
+    training_report:
+      path: "reports/training_report.json"
+
+    cv_results:
+      path: "reports/cv_results.csv"
+
+    test_results:
+      path: "reports/test_results.json"
+
+    predictions:
+      path: "reports/test_predictions.csv"
+
+    tuning_results:
+      path: "reports/tuning_results.csv"
+
+    tuning_report:
+      path: "reports/tuning_report.json"
