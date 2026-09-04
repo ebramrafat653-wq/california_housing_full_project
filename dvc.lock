@@ -5,8 +5,8 @@ stages:
     deps:
     - path: configs/data_config.yaml
       hash: md5
-      md5: d41767d8fd7016f6ce9d1d107af495df
-      size: 7444
+      md5: 6c6f03485f6c3509a2ffa29f3a0ec80b
+      size: 11242
     - path: src/data/data_loader.py
       hash: md5
       md5: 98b121d0e8fe1630f257761d33c20d39
@@ -27,6 +27,10 @@ stages:
   splitting:
     cmd: python -m src.data.splitting
     deps:
+    - path: configs/data_config.yaml
+      hash: md5
+      md5: 6c6f03485f6c3509a2ffa29f3a0ec80b
+      size: 11242
     - path: data/raw/housing.csv
       hash: md5
       md5: d1c47305887e2252bf1ccbd74ff159a6
@@ -37,9 +41,13 @@ stages:
       size: 19680
     params:
       configs/data_config.yaml:
-        split.random_state: 42
-        split.test_size: 0.15
-        split.val_size: 0.15
+        split:
+          val_size: 0.15
+          test_size: 0.15
+          random_state: 42
+          shuffle: true
+          strategy: stratified
+          n_strata_bins: 5
     outs:
     - path: data/interim
       hash: md5
@@ -49,6 +57,10 @@ stages:
   cleaning:
     cmd: python -m src.data.cleaning
     deps:
+    - path: configs/data_config.yaml
+      hash: md5
+      md5: 6c6f03485f6c3509a2ffa29f3a0ec80b
+      size: 11242
     - path: data/interim
       hash: md5
       md5: d2daf578e7662c9b67dcff2fa8d393e8.dir
@@ -56,23 +68,10 @@ stages:
       nfiles: 3
     - path: src/data/cleaning.py
       hash: md5
-      md5: 31cd00ac0fdba14ec5a61bcc79927c64
-      size: 39988
+      md5: 0cee6d55a70df4393e39bf2283c2e21c
+      size: 25738
     params:
       configs/data_config.yaml:
-        eda_derived.lof:
-          contamination: 0.02
-          n_neighbors: 20
-          features:
-          - median_income
-          - total_rooms
-          - population
-          - households
-          - longitude
-          - latitude
-          n_outliers_detected: 289
-          pct_outliers: 2.0
-          novelty: true
         eda_derived.missingness:
           total_bedrooms:
             impute: true
@@ -86,52 +85,49 @@ stages:
           pct_capped: 4.727
           n_capped: 683
           cap_threshold: 500001.0
-          transform: log1p
+          transform_candidate: log1p
+          applied_to_target: false
           capped_flag_column: is_capped
     outs:
-    - path: artifacts/cleaning_artifacts.json
+    - path: artifacts/cleaning_metadata.json
       hash: md5
-      md5: 372a3d798bacbe14bc4ad9e4cfc3d145
-      size: 433
-    - path: artifacts/lof_model.pkl
-      hash: md5
-      md5: f1224de925699ecae92d82bbf0139569
-      size: 3418666
-    - path: artifacts/lof_scaler.pkl
-      hash: md5
-      md5: 54d145519e19c64d805be917eec9f28a
-      size: 760
+      md5: 07f741c77e37e38659783cc32ff03ea4
+      size: 452
     - path: data/processed/test_clean.csv
       hash: md5
-      md5: 0c63403c3ccbc98e4b04254bcb29ca6d
-      size: 220191
+      md5: 1347eea8686cb78dbfc58c71704d0a59
+      size: 213817
     - path: data/processed/train_clean.csv
       hash: md5
-      md5: 30fc370342b7a8a4ca2bce965f6902b9
-      size: 1025953
+      md5: de7910ad4f83f640610afa3da21b78c8
+      size: 996345
     - path: data/processed/val_clean.csv
       hash: md5
-      md5: 8eb3ebefc6fc5e39036fee1ef039906f
-      size: 220008
+      md5: bbcdbe9ca3a7a638f36495ee7fe46597
+      size: 213639
   engineering:
     cmd: python -m src.features.engineering
     deps:
+    - path: configs/data_config.yaml
+      hash: md5
+      md5: 6c6f03485f6c3509a2ffa29f3a0ec80b
+      size: 11242
     - path: data/processed/test_clean.csv
       hash: md5
-      md5: 0c63403c3ccbc98e4b04254bcb29ca6d
-      size: 220191
+      md5: 1347eea8686cb78dbfc58c71704d0a59
+      size: 213817
     - path: data/processed/train_clean.csv
       hash: md5
-      md5: 30fc370342b7a8a4ca2bce965f6902b9
-      size: 1025953
+      md5: de7910ad4f83f640610afa3da21b78c8
+      size: 996345
     - path: data/processed/val_clean.csv
       hash: md5
-      md5: 8eb3ebefc6fc5e39036fee1ef039906f
-      size: 220008
+      md5: bbcdbe9ca3a7a638f36495ee7fe46597
+      size: 213639
     - path: src/features/engineering.py
       hash: md5
-      md5: c3b4628c62bc40d184e6b2599b753fb7
-      size: 21713
+      md5: 881f9e9f63e75e5cb79dbcfe40166616
+      size: 48781
     params:
       configs/data_config.yaml:
         eda_derived.engineered_features:
@@ -154,16 +150,16 @@ stages:
     outs:
     - path: data/processed/test_feat.csv
       hash: md5
-      md5: 749a507bc4868a6879b56d217c28a0a0
-      size: 426935
+      md5: 24581b00dc3992cf4679e1bc47fb4a95
+      size: 420101
     - path: data/processed/train_feat.csv
       hash: md5
-      md5: bdf5405a498b46a50859b2dccab84517
-      size: 1988503
+      md5: 0bea6d23a94f4667743c9e1e60a5ae80
+      size: 1957022
     - path: data/processed/val_feat.csv
       hash: md5
-      md5: ceed49f37e6d1d0bfd0978359da0e7b9
-      size: 426091
+      md5: c93bf157a05f7492c26d923b83d62a8a
+      size: 419279
   preprocessing:
     cmd: python -m src.features.pipeline
     deps:
@@ -201,6 +197,10 @@ stages:
   validation:
     cmd: python -m src.data.validation
     deps:
+    - path: configs/data_config.yaml
+      hash: md5
+      md5: 6c6f03485f6c3509a2ffa29f3a0ec80b
+      size: 11242
     - path: data/raw/housing.csv
       hash: md5
       md5: d1c47305887e2252bf1ccbd74ff159a6
@@ -255,6 +255,312 @@ stages:
     outs:
     - path: reports/validation
       hash: md5
-      md5: 8b42815cf4bbe53dce319902c74954e7.dir
+      md5: fcb7c1840c5aebb3defe03a1b21e4380.dir
       size: 516
       nfiles: 2
+  ml_pipeline:
+    cmd: python -m pipelines.run_pipeline
+    deps:
+    - path: configs/data_config.yaml
+      hash: md5
+      md5: 6c6f03485f6c3509a2ffa29f3a0ec80b
+      size: 11242
+    - path: configs/model_config.yaml
+      hash: md5
+      md5: 1cf748c6a15fabbbb5913a3460ae4582
+      size: 10244
+    - path: data/processed/test_clean.csv
+      hash: md5
+      md5: 1347eea8686cb78dbfc58c71704d0a59
+      size: 213817
+    - path: data/processed/train_clean.csv
+      hash: md5
+      md5: de7910ad4f83f640610afa3da21b78c8
+      size: 996345
+    - path: data/processed/val_clean.csv
+      hash: md5
+      md5: bbcdbe9ca3a7a638f36495ee7fe46597
+      size: 213639
+    - path: pipelines/run_pipeline.py
+      hash: md5
+      md5: 07f50f6cc65aac9a86f61c83b0b08b3f
+      size: 17701
+    - path: src/features/engineering.py
+      hash: md5
+      md5: 881f9e9f63e75e5cb79dbcfe40166616
+      size: 48781
+    - path: src/features/pipeline.py
+      hash: md5
+      md5: 1fb6103973253c339638f9f1d7e9abbc
+      size: 53436
+    - path: src/models/evaluation.py
+      hash: md5
+      md5: bf799d8ccc70b55282a042a6d9285fc9
+      size: 30933
+    - path: src/models/model_factory.py
+      hash: md5
+      md5: e475775e3a41a269ccab3fa8a49ba8a6
+      size: 7578
+    - path: src/models/training.py
+      hash: md5
+      md5: ab0bb8bff33e6f74746ecac518ecc5a7
+      size: 26503
+    - path: src/models/tuning.py
+      hash: md5
+      md5: 82115b4496db65d02c09b6293c2bc9e2
+      size: 23319
+    params:
+      configs/data_config.yaml:
+        eda_derived.engineered_features:
+          ratios:
+            rooms_per_household: total_rooms / households
+            bedrooms_per_room: total_bedrooms / total_rooms
+            population_per_household: population / households
+          distances:
+            dist_SF:
+              lat: 37.77
+              lon: -122.42
+            dist_LA:
+              lat: 34.05
+              lon: -118.24
+          drop_after_engineering:
+          - total_rooms
+          - total_bedrooms
+          - population
+          - households
+        eda_derived.lof:
+          contamination: 0.02
+          n_neighbors: 20
+          novelty: true
+          features:
+          - median_income
+          - total_rooms
+          - population
+          - households
+          - longitude
+          - latitude
+          n_outliers_detected: 289
+          pct_outliers: 2.0
+        eda_derived.missingness:
+          total_bedrooms:
+            impute: true
+            imputation_strategy: median
+            missing_pct: 0.969
+            chi2_pvalue_vs_ocean_proximity: 0.3095
+            mechanism: MCAR
+        features_config:
+          numerical_standard_scaler:
+          - longitude
+          - latitude
+          - housing_median_age
+          - rooms_per_household
+          - bedrooms_per_room
+          - population_per_household
+          - dist_SF
+          - dist_LA
+          numerical_robust_scaler:
+          - median_income
+          categorical_one_hot:
+          - ocean_proximity
+          passthrough:
+          - lof_outlier
+      configs/model_config.yaml:
+        artifacts:
+          output_dir: artifacts
+          final_model:
+            path: artifacts/final_model_pipeline.pkl
+          reports:
+            training_report:
+              path: reports/training_report.json
+            cv_results:
+              path: reports/cv_results.csv
+            test_results:
+              path: reports/test_results.json
+            predictions:
+              path: reports/test_predictions.csv
+            tuning_results:
+              path: reports/tuning_results.csv
+            tuning_report:
+              path: reports/tuning_report.json
+        cross_validation:
+          strategy: kfold
+          n_splits: 5
+          shuffle: true
+          random_state: 42
+          n_jobs: 1
+          scoring:
+            primary: neg_root_mean_squared_error
+            additional:
+            - neg_mean_absolute_error
+            - r2
+        data:
+          train_path: data/processed/train_clean.csv
+          validation_path: data/processed/val_clean.csv
+          test_path: data/processed/test_clean.csv
+        evaluation:
+          metrics:
+          - rmse
+          - mae
+          - r2
+          primary_metric: rmse
+          save_predictions: true
+        final_training:
+          strategy: train_plus_validation
+          use_test_for_training: false
+        mlflow:
+          enabled: true
+          experiment_name: california_housing_regression
+          tracking_uri: file:./mlruns
+          log_model: true
+          log_params: true
+          log_metrics: true
+          log_tags: true
+        model_selection:
+          primary_metric: neg_root_mean_squared_error
+          optimization_direction: minimize
+        models:
+          linear_regression:
+            enabled: true
+            class: sklearn.linear_model.LinearRegression
+            params: {}
+          ridge:
+            enabled: true
+            class: sklearn.linear_model.Ridge
+            params:
+              alpha: 1.0
+              random_state: 42
+          random_forest:
+            enabled: true
+            class: sklearn.ensemble.RandomForestRegressor
+            params:
+              n_estimators: 300
+              max_depth:
+              min_samples_split: 2
+              min_samples_leaf: 1
+              max_features: 1.0
+              n_jobs: 1
+              random_state: 42
+          gradient_boosting:
+            enabled: true
+            class: sklearn.ensemble.GradientBoostingRegressor
+            params:
+              n_estimators: 300
+              learning_rate: 0.05
+              max_depth: 3
+              min_samples_split: 2
+              min_samples_leaf: 1
+              subsample: 1.0
+              random_state: 42
+        project:
+          name: california_housing_regression
+          task: regression
+          target: median_house_value
+          random_state: 42
+        search_spaces:
+          ridge:
+            model__alpha:
+            - 0.01
+            - 0.1
+            - 1.0
+            - 10.0
+            - 100.0
+          random_forest:
+            model__n_estimators:
+            - 200
+            - 300
+            - 500
+            model__max_depth:
+            - 
+            - 10
+            - 20
+            - 30
+            model__min_samples_split:
+            - 2
+            - 5
+            - 10
+            model__min_samples_leaf:
+            - 1
+            - 2
+            - 4
+            model__max_features:
+            - 0.5
+            - 0.75
+            - 1.0
+          gradient_boosting:
+            model__n_estimators:
+            - 100
+            - 200
+            - 300
+            - 500
+            model__learning_rate:
+            - 0.01
+            - 0.03
+            - 0.05
+            - 0.1
+            model__max_depth:
+            - 2
+            - 3
+            - 4
+            - 5
+            model__min_samples_split:
+            - 2
+            - 5
+            - 10
+            model__min_samples_leaf:
+            - 1
+            - 2
+            - 4
+            model__subsample:
+            - 0.7
+            - 0.85
+            - 1.0
+        tuning:
+          enabled: true
+          method: randomized_search
+          n_iter: 30
+          scoring: neg_root_mean_squared_error
+          cv:
+            strategy: kfold
+            n_splits: 5
+            shuffle: true
+            random_state: 42
+          n_jobs: -1
+          random_state: 42
+          refit: false
+    outs:
+    - path: artifacts/final_model_pipeline.pkl
+      hash: md5
+      md5: 155cd8b1dcfd2dc5aeefd7e840ee5933
+      size: 596497971
+    - path: reports/cv_results.csv
+      hash: md5
+      md5: f110f7599d348188d3f2cd08b7127418
+      size: 1364
+    - path: reports/feature_importance.png
+      hash: md5
+      md5: 758edb5d8824afdd054bb7486a9f3c0c
+      size: 82806
+    - path: reports/metrics.json
+      hash: md5
+      md5: ab757b99e4fcfbdacd301a08cdb2f0ce
+      size: 103
+    - path: reports/pred_vs_actual.png
+      hash: md5
+      md5: 907efbe3d6e7eedabab33ccdbc3bc2f9
+      size: 252758
+    - path: reports/residuals.png
+      hash: md5
+      md5: a20552e18cb501ba3d07d4e0799e00d8
+      size: 215262
+    - path: reports/test_predictions.csv
+      hash: md5
+      md5: 28f757c5b71956c9c4dd51e3c51f8122
+      size: 199177
+    - path: reports/test_results.json
+      hash: md5
+      md5: 208887b88e47ba087f131c048b4ed986
+      size: 282
+    - path: reports/training_report.json
+      hash: md5
+      md5: 1ba05fa429329b25219cdb433f860706
+      size: 2858

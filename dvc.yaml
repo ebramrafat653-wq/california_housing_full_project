@@ -22,9 +22,10 @@ stages:
     deps:
       - src/data/validation.py
       - data/raw/housing.csv
+      - configs/data_config.yaml
     params:
       - configs/data_config.yaml:
-          - validation  # 🟢 تم التصحيح من validation_rules إلى validation
+          - validation
     outs:
       - reports/validation
 
@@ -37,11 +38,10 @@ stages:
     deps:
       - src/data/splitting.py
       - data/raw/housing.csv
+      - configs/data_config.yaml
     params:
       - configs/data_config.yaml:
-          - split.val_size
-          - split.test_size
-          - split.random_state
+          - split
     outs:
       - data/interim
 
@@ -54,22 +54,25 @@ stages:
     deps:
       - src/data/cleaning.py
       - data/interim
+      - configs/data_config.yaml
     params:
       - configs/data_config.yaml:
           - eda_derived.missingness
           - eda_derived.target_summary
-          - eda_derived.lof
     outs:
       - data/processed/train_clean.csv
       - data/processed/val_clean.csv
       - data/processed/test_clean.csv
-      - artifacts/cleaning_artifacts.json
-      - artifacts/lof_model.pkl
-      - artifacts/lof_scaler.pkl
+      - artifacts/cleaning_metadata.json
 
 
   # ============================================================
   # 5. FEATURE ENGINEERING
+  # ============================================================
+  # Deterministic lineage / inspection stage only.
+  # The training pipeline DOES NOT consume *_feat.csv.
+  # It performs the same FeatureEngineer implementation internally
+  # inside the CV-safe sklearn Pipeline.
   # ============================================================
   engineering:
     cmd: python -m src.features.engineering
@@ -78,6 +81,7 @@ stages:
       - data/processed/train_clean.csv
       - data/processed/val_clean.csv
       - data/processed/test_clean.csv
+      - configs/data_config.yaml
     params:
       - configs/data_config.yaml:
           - eda_derived.engineered_features
@@ -88,59 +92,66 @@ stages:
 
 
   # ============================================================
-  # 6. PREPROCESSING (Pipeline Fitting)
+  # 6. COMPLETE ML PIPELINE
   # ============================================================
-  preprocessing:
-    cmd: python -m src.features.pipeline
+  # DVC calls the external orchestration layer.
+  # run_pipeline.py performs:
+  #   Benchmarking
+  #        ↓
+  #   Tuning
+  #        ↓
+  #   Final Fit on Train + Validation
+  #        ↓
+  #   Final Test Evaluation
+  # All learned preprocessing remains inside sklearn Pipeline.
+  # MLflow tracking is handled by run_pipeline.py.
+  # ============================================================
+  ml_pipeline:
+    cmd: python -m pipelines.run_pipeline
     deps:
+      - pipelines/run_pipeline.py
+      - src/models/training.py
+      - src/models/tuning.py
+      - src/models/evaluation.py
+      - src/models/model_factory.py
       - src/features/pipeline.py
-      - data/processed/train_feat.csv  
+      - src/features/engineering.py
+      - data/processed/train_clean.csv
+      - data/processed/val_clean.csv
+      - data/processed/test_clean.csv
+      - configs/data_config.yaml
+      - configs/model_config.yaml
     params:
       - configs/data_config.yaml:
-          - features_config            
-    outs:
-      - artifacts/preprocessing_pipeline.pkl
-
-
-  # ============================================================
-  # 7. TRAINING
-  # ============================================================
-  training:
-    cmd: python -m src.models.training
-    deps:
-      - src/models/training.py
-      - data/processed/train_feat.csv
-      - data/processed/val_feat.csv
-      - artifacts/preprocessing_pipeline.pkl
-    params:
+          - features_config
+          - eda_derived.missingness
+          - eda_derived.lof
+          - eda_derived.engineered_features
       - configs/model_config.yaml:
-          - model_params
-          - seed
+          - project
+          - data
           - cross_validation
+          - model_selection
+          - models
+          - tuning
+          - search_spaces
+          - final_training
+          - evaluation
+          - mlflow
+          - artifacts
     outs:
-      - models
-
-
-  # ============================================================
-  # 8. EVALUATION
-  # ============================================================
-  evaluation:
-    cmd: python -m src.models.evaluation
-    deps:
-      - src/models/evaluation.py
-      - models
-      - data/processed/test_feat.csv
-      - artifacts/preprocessing_pipeline.pkl
-    params:
-      - configs/model_config.yaml:
-          - evaluation_metrics
+      - artifacts/final_model_pipeline.pkl
+      - reports/training_report.json
+      - reports/cv_results.csv
+      - reports/test_results.json
+      - reports/test_predictions.csv
     metrics:
       - reports/metrics.json:
           cache: false
     plots:
       - reports/residuals.png:
           cache: false
-      - reports/feature_importance.png:
-          cache: false
       - reports/pred_vs_actual.png:
+          cache: false
+      - reports/feature_importance.png:
           cache: false
