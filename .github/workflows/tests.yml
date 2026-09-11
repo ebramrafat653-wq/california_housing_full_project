@@ -1,54 +1,102 @@
-# ============================================
-# GitHub Actions CI Pipeline
-# ============================================
+# =============================================================================
+# .github/workflows/ci.yml
+# California Housing Full Project — Continuous Integration
+#
+# Runs on every push to main/develop and on every pull request.
+#
+# Install strategy:
+#   pip install -e ".[test,dev]"
+#     - [test] → pytest, pytest-cov, httpx (fast, required for TestClient)
+#     - [dev]  → ruff, mypy, black (lightweight, needed for lint step)
+#
+#   The heavy [pipeline] extra (dvc, kaggle, mlflow) is intentionally NOT
+#   installed in CI — it is only needed for training, not for testing the API.
+#   This keeps install time around ~60s instead of ~4min.
+# =============================================================================
+
 name: CI Tests
 
 on:
   push:
-    branches: [ main, develop ]
+    branches: [main, develop]
   pull_request:
-    branches: [ main ]
+    branches: [main, develop]
+
+# Cancel in-progress runs on the same branch when a new push arrives.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
+    name: Python ${{ matrix.python-version }}
     runs-on: ubuntu-latest
 
     strategy:
+      fail-fast: false
       matrix:
         python-version: ["3.9", "3.10", "3.11", "3.12"]
 
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      # ────────────────────────────────────────────────────────────────────
+      # 1. Checkout
+      # ────────────────────────────────────────────────────────────────────
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-    - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v5
-      with:
-        python-version: ${{ matrix.python-version }}
-        cache: 'pip'
+      # ────────────────────────────────────────────────────────────────────
+      # 2. Set up Python
+      # ────────────────────────────────────────────────────────────────────
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
 
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        # Installs core dependencies + dev tools (ruff, pytest-cov, mypy) from pyproject.toml
-        pip install -e .[dev]
+      # ────────────────────────────────────────────────────────────────────
+      # 3. Install dependencies
+      #    - [test] → pytest, pytest-cov, httpx
+      #    - [dev]  → ruff, mypy, black
+      #    NOT installed: dvc, kaggle, mlflow (in [pipeline])
+      # ────────────────────────────────────────────────────────────────────
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[test,dev]"
 
-    - name: Lint with Ruff
-      continue-on-error: true
-      run: |
-        ruff check src/ tests/
+      # ────────────────────────────────────────────────────────────────────
+      # 4. Lint with Ruff
+      #    Non-blocking: failures do not stop the build.
+      #    Remove `continue-on-error` to make lint strict.
+      # ────────────────────────────────────────────────────────────────────
+      - name: Lint with Ruff
+        continue-on-error: true
+        run: |
+          ruff check api/ src/ tests/
 
-    - name: Run unit tests (fast)
-      env:
-        KAGGLE_CONFIG_DIR: "/tmp/kaggle" # Prevents accidental Kaggle API calls in CI
-      run: |
-        # pytest automatically reads addopts from pyproject.toml (including -m 'not integration')
-        pytest --cov=src --cov-report=xml --cov-report=term-missing
+      # ────────────────────────────────────────────────────────────────────
+      # 5. Run tests with coverage
+      #    pytest reads addopts from pyproject.toml, including
+      #    `-m "not integration"` which skips integration tests.
+      # ────────────────────────────────────────────────────────────────────
+      - name: Run tests with coverage
+        env:
+          KAGGLE_CONFIG_DIR: "/tmp/kaggle"  # Prevents accidental Kaggle API calls
+        run: |
+          pytest \
+            --cov=api \
+            --cov=src \
+            --cov-report=xml \
+            --cov-report=term-missing
 
-    - name: Upload coverage to Codecov
-      # Only upload once (from Python 3.11) to save CI minutes
-      if: matrix.python-version == '3.11' && success()
-      uses: codecov/codecov-action@v4
-      with:
-        file: ./coverage.xml
-        fail_ci_if_error: false
+      # ────────────────────────────────────────────────────────────────────
+      # 6. Upload coverage to Codecov
+      #    Only from one Python version to save CI minutes.
+      # ────────────────────────────────────────────────────────────────────
+      - name: Upload coverage to Codecov
+        if: matrix.python-version == '3.11' && success()
+        uses: codecov/codecov-action@v4
+        with:
+          file: ./coverage.xml
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
