@@ -7,6 +7,7 @@
 requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
+
 # =============================================================================
 # PROJECT METADATA
 # =============================================================================
@@ -16,18 +17,19 @@ version = "1.0.0"
 description = "Production-ready ML pipeline for California Housing price prediction"
 readme = "README.md"
 requires-python = ">=3.9"
-license = {text = "MIT"}
+license = { text = "MIT" }
 
 authors = [
-    {name = "Ebram Rafat", email = "ebram.rafat@example.com"}
+    { name = "Ebram Rafat", email = "ebram.rafat@example.com" }
 ]
 
 keywords = [
-    "machine-learning", 
-    "california-housing", 
-    "dvc", 
-    "mlops", 
-    "production-pipeline"
+    "machine-learning",
+    "california-housing",
+    "dvc",
+    "mlops",
+    "production-pipeline",
+    "fastapi",
 ]
 
 classifiers = [
@@ -43,58 +45,86 @@ classifiers = [
     "Intended Audience :: Developers",
 ]
 
-# Core dependencies (installed with: pip install .)
+
+# =============================================================================
+# CORE DEPENDENCIES
+# Installed with: pip install .
+# Only what the API/inference runtime needs at import time.
+# =============================================================================
 dependencies = [
     # Core data & ML
     "pandas>=2.0.0",
     "numpy>=1.24.0",
     "scikit-learn>=1.3.0",
-    
+
     # Config & utilities
     "pyyaml>=6.0",
-    "tqdm>=4.66.0",
     "typeguard>=4.0.0",
-    
-    # Data versioning (with Google Drive support)
-    "dvc[gdrive]>=3.40.0",
-    
-    # Data source
-    "kaggle>=1.5.16",
-    
-    # Experiment tracking
-    "mlflow>=2.8.0",
-    
+
     # Web API (for serving the model)
     "fastapi>=0.104.0",
-    "uvicorn>=0.24.0",
-    
-    # Testing
-    "pytest>=7.4.0",
+    "uvicorn[standard]>=0.24.0",
+    "pydantic>=2.4.0",
 ]
 
-# Optional dependencies (installed with: pip install .[dev])
+
+# =============================================================================
+# OPTIONAL DEPENDENCY GROUPS
+# Install combinations:
+#     pip install -e ".[test]"        # fast CI (API tests only)
+#     pip install -e ".[dev]"         # full local dev
+#     pip install -e ".[pipeline]"    # DVC + MLflow + Kaggle
+#     pip install -e ".[all]"         # everything
+# =============================================================================
 [project.optional-dependencies]
+
+# ── Testing only (fast, used by CI) ────────────────────────────────────────
+test = [
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1",
+    "httpx>=0.25.0",          # Required by fastapi.testclient.TestClient
+]
+
+# ── Development tools (linters, formatters, notebooks) ────────────────────
 dev = [
     "black>=23.0",
-    "ruff>=0.1.0",
+    "ruff>=0.6.0",
     "mypy>=1.5",
-    "pytest-cov>=4.1",
-    "ipykernel>=6.0",  # For Jupyter/Colab development
+    "ipykernel>=6.0",         # For Jupyter / Colab development
+    "tqdm>=4.66.0",           # Progress bars during local development
 ]
 
-# URLs for the project
+# ── Data pipeline (heavy — only needed for training / data prep) ──────────
+pipeline = [
+    "dvc[gdrive]>=3.40.0",
+    "kaggle>=1.5.16",
+    "mlflow>=2.8.0",
+]
+
+# ── Convenience meta-extra (installs everything) ──────────────────────────
+all = [
+    "california-housing-full-project[test,dev,pipeline]",
+]
+
+
+# =============================================================================
+# PROJECT URLS
+# =============================================================================
 [project.urls]
 Homepage = "https://github.com/yourusername/california-housing-full-project"
 Repository = "https://github.com/yourusername/california-housing-full-project"
 Issues = "https://github.com/yourusername/california-housing-full-project/issues"
+Changelog = "https://github.com/yourusername/california-housing-full-project/blob/main/CHANGELOG.md"
+
 
 # =============================================================================
-# PACKAGE DISCOVERY (Auto-discover src/ directory)
+# PACKAGE DISCOVERY
 # =============================================================================
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["src*"]
+include = ["api*", "src*"]
 namespaces = false
+
 
 # =============================================================================
 # PYTEST CONFIGURATION
@@ -105,29 +135,36 @@ testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
+
 addopts = [
     "-v",
     "--strict-markers",
-    "-m", "not integration",  # Skip integration tests by default
+    "-m", "not integration",
     "--tb=short",
 ]
+
 markers = [
     "integration: end-to-end tests requiring external services (DVC, Kaggle)",
     "slow: tests that take >5 seconds",
     "requires_dvc: tests requiring DVC initialization",
 ]
+
 filterwarnings = [
     "ignore::DeprecationWarning",
     "ignore::UserWarning",
     "ignore::PendingDeprecationWarning",
 ]
 
+
 # =============================================================================
-# RUFF CONFIGURATION (Fast Python Linter & Formatter)
+# RUFF CONFIGURATION (modern format, ruff >= 0.2)
 # =============================================================================
 [tool.ruff]
 target-version = "py39"
 line-length = 88
+src = ["src", "api", "tests"]
+
+[tool.ruff.lint]
 select = [
     "E",   # pycodestyle errors
     "W",   # pycodestyle warnings
@@ -136,28 +173,32 @@ select = [
     "B",   # flake8-bugbear
     "C4",  # flake8-comprehensions
     "UP",  # pyupgrade
+    "N",   # pep8-naming
+    "SIM", # flake8-simplify
 ]
+
 ignore = [
-    "E501",  # line too long (handled by black/formatter)
-    "B008",  # do not perform function calls in argument defaults
+    "E501",  # line too long (handled by black)
+    "B008",  # function calls in argument defaults (FastAPI Depends)
     "C901",  # too complex
 ]
 
-[tool.ruff.per-file-ignores]
-"__init__.py" = ["F401"]  # Allow unused imports in __init__.py
-"tests/*" = ["B011"]      # Allow assert False in tests
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]     # Allow unused imports in __init__.py
+"tests/*" = ["B011", "S101"] # Allow assert statements in tests
 
-[tool.ruff.isort]
-known-first-party = ["src"]
+[tool.ruff.lint.isort]
+known-first-party = ["api", "src"]
+
 
 # =============================================================================
-# MYPY CONFIGURATION (Static Type Checker)
+# MYPY CONFIGURATION
 # =============================================================================
 [tool.mypy]
 python_version = "3.9"
 warn_return_any = true
 warn_unused_configs = true
-disallow_untyped_defs = false  # Gradual typing
+disallow_untyped_defs = false
 disallow_incomplete_defs = false
 check_untyped_defs = true
 no_implicit_optional = true
@@ -174,15 +215,17 @@ module = [
     "yaml.*",
     "kaggle.*",
     "mlflow.*",
+    "dvc.*",
 ]
 ignore_missing_imports = true
 
+
 # =============================================================================
-# BLACK CONFIGURATION (Code Formatter)
+# BLACK CONFIGURATION
 # =============================================================================
 [tool.black]
 line-length = 88
-target-version = ['py39', 'py310', 'py311', 'py312']
+target-version = ["py39", "py310", "py311", "py312"]
 include = '\.pyi?$'
 extend-exclude = '''
 /(
@@ -199,9 +242,25 @@ extend-exclude = '''
 )/
 '''
 
+
 # =============================================================================
-# DVC CONFIGURATION (Optional CLI defaults)
+# COVERAGE CONFIGURATION
 # =============================================================================
-[tool.dvc]
-# Note: Most DVC config is done via `dvc remote add` CLI
-# This section is for optional pyproject.toml integration
+[tool.coverage.run]
+source = ["api", "src"]
+omit = [
+    "*/tests/*",
+    "*/__init__.py",
+    "*/migrations/*",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+    "@abstractmethod",
+]
